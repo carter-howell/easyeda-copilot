@@ -63,19 +63,58 @@ function sheetSpaceNotice(response: unknown) {
 }
 
 export function registerCircuitTools(server: McpServer, bridge: Bridge) {
+    const ComponentSearchKind = z.enum(['device', 'footprint', 'panel_library', 'all']);
+    const ComponentSearchLibrary = z.enum([
+        'system',
+        'recent',
+        'personal',
+        'project',
+        'public',
+        'std_edition_public',
+        'favorite',
+        'lcsc',
+        'all',
+    ]);
+
     server.registerTool(
         'component_search',
         {
             title: 'Search EasyEDA Component',
-            description: 'Search components. Prefer an exact part_uuid or manufacturer MPN; use a short part description only to discover candidates when the exact MPN is unknown.',
+            description: 'Search components. Exact part_uuid or MPN uses the LCSC catalog. Use query/kind/libraries for System, Recent, Personal, Project, Public, Std Edition Public, Favorite, and LCSC editor libraries. All sections are searched by default. Pass a device result uuid as part_uuid and its libraryUuid as library_uuid when adding it to the schematic.',
             inputSchema: z.object({
                 part_uuid: z.string().nullable().optional(),
                 MPN: z.string().nullable().optional(),
+                query: z.string().nullable().optional()
+                    .describe('Keyword for searching the open EasyEDA editor libraries, such as "ESP32-S3" or "PCA9685".'),
+                kind: z.union([ComponentSearchKind, z.array(ComponentSearchKind)]).optional()
+                    .describe('EasyEDA library item type to search. Use all to search devices, footprints, and panel-library modules.'),
+                libraries: z.array(ComponentSearchLibrary).optional()
+                    .describe('Sections to search: System, Recent, Personal, Project, Public, Std Edition Public, Favorite, and LCSC. Defaults to all.'),
+                limit: z.number().int().min(1).max(50).default(10)
+                    .describe('Maximum results per searched section.'),
+                page: z.number().int().min(1).max(100).default(1)
+                    .describe('Search result page per section.'),
             }),
         },
-        async ({ part_uuid, MPN }) => {
+        async ({ part_uuid, MPN, query, kind, libraries, limit, page }) => {
+            const easyEdaQuery = query?.trim();
+            if (easyEdaQuery || kind || libraries?.length) {
+                if (!easyEdaQuery) {
+                    return textResult('Fill query when using kind or libraries.');
+                }
+
+                const result = await bridge.requestEasyEda('component-library-search', {
+                    query: easyEdaQuery,
+                    kind,
+                    libraries,
+                    limit,
+                    page,
+                }, 120_000);
+                return textResult(result);
+            }
+
             if (!part_uuid && !MPN) {
-                return textResult('Fill one: part_uuid or MPN');
+                return textResult('Fill one: part_uuid, MPN, or query');
             }
 
             const result = await componentSearch({ part_uuid, MPN });
@@ -118,6 +157,9 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             const circuit = CircuitModStruct().parse(file_path !== undefined
                 ? JSON.parse(await readFile(file_path, 'utf8'))
                 : inlineCircuit);
+            if (circuit.add_components.some(c => c.library_uuid || !/^[0-9a-f]{32}$/.test(c.part_uuid))) {
+                return textResult(await bridge.requestEasyEda('apply-library-circuit', circuit as unknown as Record<string, unknown>, 300000));
+            }
             const missingPartUuid = circuit.add_components
                 .filter(component => !component.part_uuid || /^0+$/.test(component.part_uuid))
                 .map(component => component.designator);
@@ -130,6 +172,9 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             }
 
             const resolvedInputCircuit = await bridge.requestEasyEda('get-schematic') as ExplainCircuit;
+            if (resolvedInputCircuit.components.some(c => c.library_uuid || (c.part_uuid && !/^[0-9a-f]{32}$/.test(c.part_uuid)))) {
+                return textResult(await bridge.requestEasyEda('apply-library-circuit', circuit as unknown as Record<string, unknown>, 300000));
+            }
             const result = await extractCircuit({ circuit, inputCircuit: resolvedInputCircuit });
             const assembled = await bridge.requestEasyEda('assemble-circuit', result as Record<string, unknown>, 300000);
             const sheetSpace = sheetSpaceNotice(assembled);

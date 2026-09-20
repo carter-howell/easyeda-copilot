@@ -6,6 +6,7 @@ import { SKILL_DOC_PATH } from "../../utils/dirs";
 import { registerPcbLayoutTools } from "./pcb-layout";
 import { registerPcbPreviewTools } from "./pcb-preview";
 import { registerPcbRoutingTools } from "./pcb-routing";
+import { confirmEasyEdaImportChanges } from "../../../../additions/mcp/confirm-easyeda-import.mjs";
 
 export function registerPcbTools(server: McpServer, bridge: Bridge) {
     server.registerTool(
@@ -34,7 +35,8 @@ export function registerPcbTools(server: McpServer, bridge: Bridge) {
             const result = await bridge.requestEasyEda('import-pcb-changes', {
                 schematicUuid: schematic_uuid,
             }, 300000);
-            return textResult(result);
+            const confirmation = await confirmEasyEdaImportChanges();
+            return textResult({ import: result, confirmation });
         },
     );
 

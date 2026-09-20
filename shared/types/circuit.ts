@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { LCSC_uuid } from "./lcsc";
 import { ReusedCategory, ReusedTags } from "./reused";
+
+const LibraryDeviceId = () => z.string().regex(/^(?:[0-9a-f]{16}|[0-9a-f]{32}|deviceFromSTD\[[0-9a-f]{32}\])$/);
 
 export const PinSchema = () => z.object({
     pin_number: z.union([z.number(), z.string()]).describe('Pin number.'),
@@ -14,7 +15,8 @@ export const BaseComponentSchema = () => z.object({
     pins: z.array(PinSchema()).describe('Pin details.'),
     block_name: z.string().describe('Reference to the block.'),
     search_query: z.string().describe('A component search question. For example: "1k 1W smd resistor", "LM358", "2-pin power connector"'),
-    part_uuid: LCSC_uuid().nullable().describe("If you know the part_uuid of the lcsc component, be sure to fill in this field; otherwise, fill in null.")
+    part_uuid: LibraryDeviceId().nullable().describe('Device ID returned by component_search.'),
+    library_uuid: z.string().min(1).optional().describe('Exact libraryUuid returned by component_search; required for non-LCSC library devices.')
 });
 
 export const CircuitReusedBlockSchema = () => z.object({
@@ -140,7 +142,8 @@ export const ExplainComponentSchema = () => z.object({
     designator: z.string().describe('Component identifier (e.g., "U1", "R5", "J1", "X1").'),
     value: z.string().describe('Minimum description: for simple components — only the nominal value; for microcircuits — only the name. Only ASCII symbols (e.g., "LM358", "10nF", "100k").'),
     pins: z.array(ExplainPinSchema()).describe('Pin details.'),
-    part_uuid: LCSC_uuid().nullable().describe('Unique component identifier.'),
+    part_uuid: LibraryDeviceId().nullable().describe('Unique component identifier.'),
+    library_uuid: z.string().min(1).optional(),
     pos: z.object({
         x: z.number(),
         y: z.number(),
@@ -157,7 +160,7 @@ export const ExplainCircuitStruct = () => z.object({
 
 export const CircuitModStruct = () => z.object({
     add_components: (z.array(BaseComponentSchema().omit({ part_uuid: true }).extend({
-        part_uuid: LCSC_uuid().describe("part_uuid of the lcsc component")
+        part_uuid: LibraryDeviceId().describe('Device ID returned by component_search')
     })).describe('Components to add')),
     add_reused_blocks: (z.array(CircuitReusedBlockSchema()).describe('reuded blocks to add')),
     rm_components: ((z.array(z.string().describe('component designator')).nullable().describe('Components to remove from the circuit'))),

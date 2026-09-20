@@ -1,4 +1,8 @@
 import { assembleCircuit, deleteCopilotBlockBoxes } from './eda/assemble';
+import { searchComponentLibraries } from '../../additions/extension/library-search';
+import { deleteBoardWithDocuments } from '../../additions/extension/delete-board';
+import { applyLibraryCircuit } from '../../additions/extension/library-circuit';
+import { CircuitModStruct } from '@copilot/shared/types/circuit';
 import { annotateDesignators } from './eda/annotate-designators';
 import {
     applyRoutingCopper,
@@ -7,6 +11,7 @@ import {
 } from './eda/pcb-assemble';
 import { checkpointer } from './eda/checkpointer';
 import { CheckpointScopes } from './eda/checkpoint-scopes';
+import { interruptJavaScriptExecution } from '../../additions/extension/execute-js-control';
 const checkpointScopes = new CheckpointScopes(checkpointer);
 import { checkPcbDrc } from './eda/drc';
 import { previewPcb } from './eda/pcb-preview';
@@ -245,6 +250,7 @@ async function restoreBeautifyComponentIdentities(saved: BeautifyComponentIdenti
 function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
+
 
 function assertDrcBundle(value: unknown): asserts value is PcbDrcBundle {
     if (!isRecord(value) || !isRecord(value.ruleConfiguration) || !Array.isArray(value.netRules)) {
@@ -1131,7 +1137,8 @@ async function getProjectInfo() {
         }
     };
 
-    const filterSch = (sch: IDMT_SchematicItem) => {
+    const filterSch = (sch: IDMT_SchematicItem | null | undefined) => {
+        if (!sch) return null;
         return {
             name: sch.name,
             itemType: sch.itemType,
@@ -1147,19 +1154,19 @@ async function getProjectInfo() {
                 name: item.name,
                 itemType: item.itemType,
                 schematic: filterSch(item.schematic),
-                pcb: {
+                pcb: item.pcb ? {
                     name: item.pcb.name,
                     itemType: item.pcb.itemType,
                     uuid: item.pcb.uuid,
                     parentBoardName: item.pcb.parentBoardName
-                },
+                } : null,
             })
         }
         else if (item.itemType === EDMT_ItemType.SCHEMATIC) {
             project_data.push({
                 name: item.name,
                 itemType: item.itemType,
-                page: filterSch(item).page,
+                page: filterSch(item)!.page,
                 uuid: item.uuid,
                 parentBoardUuid: item.parentBoardUuid
             })
@@ -1176,6 +1183,7 @@ async function getProjectInfo() {
 
     return {
         project_data,
+        project_uuid: projectInfo.uuid,
         project_name: projectInfo.friendlyName,
         description: projectInfo.description
     };
@@ -1698,6 +1706,24 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             return;
         }
 
+        if (message.event === 'interrupt-execute-js') {
+            const reason = typeof body.reason === 'string' && body.reason.trim()
+                ? body.reason.trim()
+                : 'Interrupted by MCP client';
+            reply(true, interruptJavaScriptExecution(reason));
+            return;
+        }
+
+        if (message.event === 'component-library-search') {
+            const result = await searchComponentLibraries(body);
+            reply(true, result);
+            return;
+        }
+
+        if (message.event === 'apply-library-circuit') {
+            return reply(true, await applyLibraryCircuit(CircuitModStruct().parse(body)));
+        }
+
         if (message.event === 'create-schematic') {
             const boardName = typeof body.boardName === 'string' ? body.boardName : undefined;
             const schematicFirstPageUuid = await eda.dmt_Schematic.createSchematic(boardName);
@@ -1771,8 +1797,12 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
         if (message.event === 'delete-doc') {
             if (typeof body.board_name === 'string') {
-                const success = await eda.dmt_Board.deleteBoard(body.board_name);
-                reply(true, { success });
+                return reply(true, await deleteBoardWithDocuments(body.board_name, {
+                    boards: () => eda.dmt_Board.getAllBoardsInfo(),
+                    deleteBoard: name => eda.dmt_Board.deleteBoard(name),
+                    deleteSchematic: uuid => eda.dmt_Schematic.deleteSchematic(uuid),
+                    deletePcb: uuid => eda.dmt_Pcb.deletePcb(uuid),
+                }));
             }
 
             const uuid = body.uuid;
@@ -1788,7 +1818,7 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
             if (doc.itemType === EDMT_ItemType.SCHEMATIC) {
                 const success = await eda.dmt_Schematic.deleteSchematic(uuid);
-                reply(true, { success });
+                return reply(true, { success });
             }
             else if (doc.itemType === EDMT_ItemType.SCHEMATIC_PAGE) {
                 const success = await eda.dmt_Schematic.deleteSchematicPage(uuid);
@@ -1816,8 +1846,12 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             const schematicUuid = typeof body.schematicUuid === 'string' ? body.schematicUuid : undefined;
 
             const success = await eda.pcb_Document.importChanges(schematicUuid);
-            if (success) return reply(true, { success, message: `In EasyEDA, when importing changes, the import dialog window opens if there are changes, or it does not open if there are no changes. In either case, the user must manually confirm the action within that dialog window (if it appears) to complete the import process.` });
-            return reply(true, { success });
+            return reply(success, {
+                success,
+                message: success
+                    ? 'EasyEDA opened the PCB import flow.'
+                    : 'Failed to import schematic changes into PCB.',
+            });
         }
 
         if (message.event === 'assemble-circuit') {
@@ -2034,7 +2068,8 @@ function tryConnectMcp(showErrors = false) {
                 const data = typeof event.data === 'string' ? event.data : String(event.data);
                 const message = JSON.parse(data) as McpMessage;
 
-                if (message.event === 'connected' || message.event === 'pong') {
+                if (message.event === 'connected' || message.event === 'pong'
+                    || message.event === 'interrupt-execute-js') {
                     await handleMessage(message, connectionEpoch);
                     return;
                 }

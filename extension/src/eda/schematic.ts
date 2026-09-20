@@ -1,6 +1,7 @@
 import type { CircuitAssembly, ExplainCircuit } from '@copilot/shared/types/circuit';
 import { searchComponentInSCH } from './search';
 import { getBBox, getPrimitiveById, normalizeWireLine, to2, withTimeout } from './utils';
+import { getCatalogDeviceId } from '../../../additions/extension/catalog-device-id';
 
 let lastToastTime = 0;
 const TOAST_THROTTLE_MS = 8000;
@@ -249,7 +250,8 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
 
         const component_ = {
             designator,
-            part_uuid: null,
+            part_uuid: getCatalogDeviceId(otherProperty, primitiveComponent.getState_Component()?.uuid),
+            library_uuid: primitiveComponent.getState_Component()?.libraryUuid,
             pins: [...(component?.pins ?? []), ...pins],
             value,
             pos: {
@@ -321,7 +323,8 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
             designator: component.designator,
             pins: component.pins,
             value: component.value,
-            part_uuid: device?.uuid ?? null,
+            part_uuid: device?.uuid ?? component.part_uuid,
+            library_uuid: device ? undefined : component.library_uuid,
         };
 
         if (component.footprint_uuid) {

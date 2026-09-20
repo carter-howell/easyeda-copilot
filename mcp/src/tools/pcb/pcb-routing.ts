@@ -4,6 +4,7 @@ import type { Bridge } from '../../bridge';
 import { runPcbRouterDsl } from '../../routing/routing-operation';
 import { ROUTER_DSL_DOC_PATH, SKILL_DOC_PATH } from '../../utils/dirs';
 import { textResult } from '../../utils/tool-result';
+import { registerCompatibilityAutoRouter } from '../../../../additions/mcp/auto-router-compat.mjs';
 
 const DEFAULT_ROUTING_WAIT_MS = 30_000;
 
@@ -25,4 +26,12 @@ export function registerPcbRoutingTools(server: McpServer, bridge: Bridge) {
             wait_ms ?? DEFAULT_ROUTING_WAIT_MS,
         )),
     );
+
+    registerCompatibilityAutoRouter({
+        server,
+        bridge,
+        runPcbRouterDsl,
+        textResult,
+        z,
+    });
 }

@@ -39,7 +39,7 @@ Keep a short working record: target instance/document UUID, requested stage, exa
 - New or substantially expanded schematics must use functional EasyEDA schematic pages.
 - Use explicit, resolved components with real part UUIDs.
 - `beautify_schematic_on_current_page` rebuilds the entire current page. Every current-page component must appear in exactly one functional block.
-- After `import_pcb_changes`, stop and ask the user to confirm the EasyEDA import dialog. Do not continue until the user says it is complete.
+- `import_pcb_changes` confirms the exact visible `Apply Changes` action automatically. Continue on `applied` or `not_needed`; report `unavailable` rather than assuming completion.
 - Open the target PCB before `make_pcb_layout`; this supplies its outline and component positions to `preserve(...)`.
 - Treat placement and routing as one coupled physical problem: plan plausible signal, power, return, escape, and thermal paths before placement, then verify placement feasibility before routing. High density is valid when the intended layer and via strategy supports it.
 - Placement preview is not applied. Assemble only a reviewed, completed final `layoutId` within the user's authorization; follow the placement guide's approval rules.
