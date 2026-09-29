@@ -9,6 +9,7 @@ import { checkpointer } from './eda/checkpointer';
 import { CheckpointScopes } from './eda/checkpoint-scopes';
 const checkpointScopes = new CheckpointScopes(checkpointer);
 import { checkPcbDrc } from './eda/drc';
+import { deleteBoardWithDocuments } from './eda/delete-board';
 import { previewPcb } from './eda/pcb-preview';
 import type { PreviewPcbInput } from '@copilot/shared/types/pcb/preview';
 import {
@@ -1770,8 +1771,19 @@ async function handleMessage(message: McpMessage, connectionEpoch: number, signa
 
         if (message.event === 'delete-doc') {
             if (typeof body.board_name === 'string') {
-                const success = await mcpCommandStep(signal, () => eda.dmt_Board.deleteBoard(body.board_name as string));
-                return reply(true, { success });
+                const boardName = body.board_name as string;
+                if (body.delete_linked_documents !== true) {
+                    const success = await mcpCommandStep(signal, () => eda.dmt_Board.deleteBoard(boardName));
+                    return reply(true, { success });
+                }
+                return reply(true, await deleteBoardWithDocuments(boardName, {
+                    boards: () => mcpCommandStep(signal, () => eda.dmt_Board.getAllBoardsInfo()),
+                    schematics: () => mcpCommandStep(signal, () => eda.dmt_Schematic.getAllSchematicsInfo()),
+                    pcbs: () => mcpCommandStep(signal, () => eda.dmt_Pcb.getAllPcbsInfo()),
+                    deleteBoard: name => mcpCommandStep(signal, () => eda.dmt_Board.deleteBoard(name)),
+                    deleteSchematic: uuid => mcpCommandStep(signal, () => eda.dmt_Schematic.deleteSchematic(uuid)),
+                    deletePcb: uuid => mcpCommandStep(signal, () => eda.dmt_Pcb.deletePcb(uuid)),
+                }));
             }
 
             const uuid = body.uuid;

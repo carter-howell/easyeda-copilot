@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
     CreateDocInputSchema,
+    DeleteDocInputSchema,
     OpenDocumentInputSchema,
     createDoc,
     openDocument,
@@ -30,6 +31,7 @@ assert.equal(registeredTools.includes('open_project'), false);
 assert.equal(registeredTools.includes('create_doc'), true);
 assert.equal(registeredTools.includes('open_document'), true);
 assert.equal(registeredTools.includes('save_doc'), true);
+assert.equal(registeredTools.includes('delete_doc'), true);
 assert.equal(registeredTools.includes('get_all_projects'), true);
 
 assert.equal(OpenDocumentInputSchema.safeParse({}).success, false);
@@ -40,6 +42,22 @@ assert.equal(OpenDocumentInputSchema.safeParse({
 assert.equal(OpenDocumentInputSchema.safeParse({ project_uuid: 'project-1' }).success, true);
 assert.equal(CreateDocInputSchema.safeParse({
     doc: { doc_type: 'project', project_friendly_name: '   ' },
+}).success, false);
+assert.deepEqual(
+    DeleteDocInputSchema.parse({ doc: { board_name: 'Temporary' } }),
+    { doc: { board_name: 'Temporary', delete_linked_documents: false } },
+);
+assert.deepEqual(
+    DeleteDocInputSchema.parse({
+        doc: { board_name: 'Temporary', delete_linked_documents: true },
+    }),
+    { doc: { board_name: 'Temporary', delete_linked_documents: true } },
+);
+assert.equal(DeleteDocInputSchema.safeParse({
+    doc: { uuid: 'schematic-1', delete_linked_documents: true },
+}).success, false);
+assert.equal(DeleteDocInputSchema.safeParse({
+    doc: { uuid: 'schematic-1', board_name: 'Temporary' },
 }).success, false);
 assert.equal(CreateDocInputSchema.safeParse({
     doc: {
