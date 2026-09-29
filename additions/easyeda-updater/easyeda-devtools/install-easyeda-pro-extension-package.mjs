@@ -91,7 +91,7 @@ function rootNameFromZip(files) {
 async function buildPayload(eextPath) {
   const archive = await readFile(eextPath);
   const zip = await JSZip.loadAsync(archive);
-  const filePaths = Object.keys(zip.files).filter((path) => !zip.files[path].dir);
+  const filePaths = Object.keys(zip.files);
   const rootName = rootNameFromZip(filePaths);
   const stripRoot = (path) => rootName && path.startsWith(`${rootName}/`) ? path.slice(rootName.length + 1) : path;
 
@@ -100,7 +100,8 @@ async function buildPayload(eextPath) {
   for (const rawPath of filePaths) {
     const normalizedPath = stripRoot(rawPath).replaceAll('\\', '/');
     if (!normalizedPath) continue;
-    const data = await zip.files[rawPath].async('nodebuffer');
+    const directory = zip.files[rawPath].dir;
+    const data = directory ? Buffer.alloc(0) : await zip.files[rawPath].async('nodebuffer');
     if (normalizedPath === 'extension.json') config = JSON.parse(asText(data));
     entries.push({
       path: normalizedPath,
@@ -108,6 +109,7 @@ async function buildPayload(eextPath) {
       type: guessType(normalizedPath),
       base64: data.toString('base64'),
       size: data.length,
+      directory,
     });
   }
 
@@ -116,6 +118,7 @@ async function buildPayload(eextPath) {
     eextFileName: basename(eextPath),
     fileSize: archive.length,
     config,
+    archiveBase64: archive.toString('base64'),
     entries,
   };
 }
@@ -237,7 +240,13 @@ async function main() {
               isInExtensionStore: previousIndex?.isInExtensionStore ?? false,
             };
             writeIndexStore.put(nextIndex);
-            if (previousUserConfig) writeUserConfigStore.put(previousUserConfig);
+            writeUserConfigStore.put(previousUserConfig || { uuid: extensionUuid, configs: {} });
+            writeObjectStore.put({
+              key: extensionUuid,
+              uuid: extensionUuid,
+              path: '',
+              source: new File([b64ToBytes(payload.archiveBase64)], payload.eextFileName, { type: 'application/octet-stream' }),
+            });
             for (const entry of payload.entries) {
               const source = new File([b64ToBytes(entry.base64)], entry.name, { type: entry.type });
               writeObjectStore.put({

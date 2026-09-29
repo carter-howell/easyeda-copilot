@@ -198,10 +198,16 @@ test('bridge forwards instance selection and promptly rejects disconnection', as
 });
 
 test('schema accepts project and Standard Edition device IDs with library identity', async () => {
-  const { CircuitModStruct } = await moduleFrom('../../shared/types/circuit.ts', { require: id => id === './reused' ? {} : require(id) });
-  for (const part_uuid of ['0fc94267955b4842', 'deviceFromSTD[4df30f666ff9467c8e3913b168dffa0d]']) {
+  const lcsc = await moduleFrom('../../shared/types/lcsc.ts', { require });
+  const { CircuitModStruct } = await moduleFrom('../../shared/types/circuit.ts', {
+    require: id => id === './reused' ? {} : id === './lcsc' ? lcsc : require(id),
+  });
+  for (const part_uuid of [
+    { uuid: '0fc94267955b4842', libraryUuid: 'user' },
+    { uuid: 'deviceFromSTD[4df30f666ff9467c8e3913b168dffa0d]', libraryUuid: 'stdPublic' },
+  ]) {
     const input = { add_components: [{ part_uuid, library_uuid: 'stdPublic', designator: 'U1', value: 'PCA9685', pins: [], block_name: 'servo', search_query: 'PCA9685' }], add_reused_blocks: [], rm_components: null, external_connect: null, external_rm_connect: null };
-    assert.equal(CircuitModStruct().parse(input).add_components[0].library_uuid, 'stdPublic');
+    assert.equal(CircuitModStruct().parse(input).add_components[0].part_uuid.libraryUuid, part_uuid.libraryUuid);
   }
 });
 

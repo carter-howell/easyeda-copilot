@@ -5,6 +5,7 @@ import JSZip from 'jszip';
 import { editorTargets, evaluate } from './cdp.mjs';
 import { saveEditorDocuments } from './save-documents.mjs';
 import { withProxy } from '../easyeda-bridge/request-easyeda.mjs';
+import { confirmEasyEdaImportChanges } from '../mcp/confirm-easyeda-import.mjs';
 
 const [command, packageFile, projectId, portArg] = process.argv.slice(2);
 const port = Number(portArg || 9222);
@@ -76,14 +77,27 @@ async function main() {
     })()`);
   }
   if (command === 'install') {
-    return evaluate(target, `(async()=>{
+    const requested = await evaluate(target, `(async()=>{
       const bus=window.top._MSG_BUS2_EXTAPI_;
       const bytes=Uint8Array.from(atob(${JSON.stringify(bytes.toString('base64'))}), c=>c.charCodeAt(0));
       const file=new File([bytes],${JSON.stringify(basename(packageFile))},{type:'application/octet-stream'});
-      await bus.rpcCall('extensionApi.importExtensionPackages',{files:[file],action:'import'});
-      await bus.rpcCall('extensionApi.setExtensionStatus',{uuid:${JSON.stringify(config.uuid)},statusName:'isEnable',status:true});
-      return {imported:true};
+      try { await bus.rpcCall('extensionApi.importExtensionPackages',{files:[file],action:'import'}); }
+      catch(error) {
+        if(!String(error).includes("close code must be")) throw error;
+      }
+      return {requested:true};
     })()`, 120000);
+    const confirmation = await confirmEasyEdaImportChanges({ port, timeoutMs: 15000 });
+    if (confirmation.status === 'unavailable') {
+      throw new Error('Apply Changes confirmation was unavailable: ' + JSON.stringify(confirmation));
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const enabled = await evaluate(target, `(async()=>{
+      const bus=window.top._MSG_BUS2_EXTAPI_;
+      await bus.rpcCall('extensionApi.setExtensionStatus',{uuid:${JSON.stringify(config.uuid)},statusName:'isEnable',status:true});
+      return {enabled:true};
+    })()`);
+    return { requested, confirmation, enabled };
   }
   if (command !== 'verify') throw new Error('Unknown package operation: ' + command);
   const actual = await evaluate(target, `(async()=>{

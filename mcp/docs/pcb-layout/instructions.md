@@ -7,7 +7,7 @@ Read `dsl.ts` as the exact syntax source. The files in `examples/` are patterns,
 ## Start
 
 1. Resolve the BOARD, linked schematic, and target PCB with `get_current_project_info`.
-2. If schematic changes must be imported, open the target PCB, call `import_pcb_changes`, then **stop and ask the user to confirm the EasyEDA import dialog**. Continue only after confirmation.
+2. If schematic changes must be imported, open the target PCB and call `import_pcb_changes`. It confirms the exact visible `Apply Changes` action automatically. Continue only when `confirmation.status` is `applied` or `not_needed`; stop and report `unavailable` rather than assuming completion.
 3. Inspect [schematic groups](../schematic/groups.md). For a new or full placement, call `get_schematic_groups({ get_full_schematic_groups: true })`, then call `get_schematic({ get_full_schematic: true })` once for complete connectivity. For a scoped placement, open an affected schematic page and use the default current-page mode with only the schematic context needed for that scope. Reuse fresh results already in context.
 4. Open the target PCB before `make_pcb_layout`. The MCP captures its outline and linked schematic-component positions as `existingPlacement`.
 5. Call `get_pcb_component_sizes` once for the required designators. Use `includeAll: true` only when sizing or validating the board genuinely requires every component; its output is much larger.

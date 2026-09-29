@@ -8,6 +8,16 @@ import { registerPcbPreviewTools } from "./pcb-preview";
 import { registerPcbRoutingTools } from "./pcb-routing";
 import { toolHandler } from '../handler';
 
+type ImportConfirmation = { status: string; method?: string; reason?: string };
+
+async function confirmImportedChanges(): Promise<ImportConfirmation> {
+    const helperUrl = new URL('../../' + 'additions/mcp/confirm-easyeda-import.mjs', import.meta.url);
+    const helper = await import(helperUrl.href) as {
+        confirmEasyEdaImportChanges: () => Promise<ImportConfirmation>;
+    };
+    return helper.confirmEasyEdaImportChanges();
+}
+
 export function registerPcbTools(server: McpServer, bridge: Bridge) {
     server.registerTool(
         'get_pcb_stack_layers',
@@ -27,7 +37,7 @@ export function registerPcbTools(server: McpServer, bridge: Bridge) {
         'import_pcb_changes',
         {
             title: 'Import PCB Changes',
-            description: `Import schematic changes into the currently opened PCB document. If schematic_uuid is omitted, EasyEDA uses the schematic linked to the same board. Open the target PCB document first. For PCB docs, read the local docs folder: ${SKILL_DOC_PATH}`,
+            description: `Import schematic changes into the currently opened PCB document and confirm EasyEDA's exact visible Apply Changes action automatically. If schematic_uuid is omitted, EasyEDA uses the schematic linked to the same board. The result reports confirmation as applied, not_needed, or unavailable; do not continue PCB mutation when confirmation is unavailable. Open the target PCB document first. For PCB docs, read the local docs folder: ${SKILL_DOC_PATH}`,
             annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
             inputSchema: z.object({
                 schematic_uuid: z.string().min(1).optional().describe('Optional schematic UUID to import changes from.'),
@@ -37,7 +47,8 @@ export function registerPcbTools(server: McpServer, bridge: Bridge) {
             const result = await bridge.requestEasyEda('import-pcb-changes', {
                 schematicUuid: schematic_uuid,
             });
-            return textResult(result);
+            const confirmation = await confirmImportedChanges();
+            return textResult({ import_result: result, confirmation });
         }),
     );
 

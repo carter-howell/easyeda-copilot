@@ -10,8 +10,11 @@ This folder contains independently testable extension and MCP capabilities that 
 - `mcp/auto-router-compat.mjs` registers `auto_route_pcb`, a non-destructive compatibility entry point for EasyEDA desktop releases older than 3.2.162 that do not expose `pcb_Document.autoRouting()`. It preserves existing copper, imports the current native DRC rules, and uses the transactional router's supported KRT fallback when needed.
 - `mcp/confirm-easyeda-import.mjs` confirms only the exact visible `Apply Changes` action and reports `applied`, `not_needed`, or `unavailable` instead of assuming success.
 - `mcp/execute-js-control.mjs` exposes cooperative interruption without releasing the extension command queue or bypassing checkpoint scopes.
+- `easyeda-project-protection/` creates hashed project backups and safely switches the desktop client to Half-Offline mode.
+- `easyeda-updater/` installs, enables, and hash-verifies extension packages, including automatic confirmation of EasyEDA's exact Apply Changes action.
 - `extension/` implements library search, exact library-device placement, whole-page schematic snapshots, cooperative execution control, and non-orphaning board cleanup.
 - `tests/` contains regression tests for these additions.
+- `workflows/` contains reusable, configuration-driven engineering procedures. `workflows/easyeda-schematic-to-pcb/` preserves an existing PCB while importing schematic changes and creating synchronized, component-owned silkscreen names.
 
 Keep new plugin-specific helper code here instead of mixing it into the upstream source tree.
 
