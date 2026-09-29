@@ -1,3 +1,5 @@
+import { abortable, currentSignal, currentTarget } from '../operations/cancellation';
+import { commandTimeoutMs, TIMEOUT_POLICY } from '@copilot/shared/timeout-policy';
 import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { EXECUTE_JS_MAX_WIRE_BYTES } from '@copilot/shared/types/execute-js';
@@ -10,15 +12,18 @@ type WsMessage = {
 export type EasyEdaInstance = {
     instanceId: string;
     projectName: string;
+    extensionVersion?: string;
     connectedAt: number;
     lastSeenAt: number;
 };
 
 export type Bridge = {
-    requestEasyEda(event: string, body?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+    requestEasyEda(event: string, body?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<unknown>;
     listEasyEdaInstances(): Promise<EasyEdaInstance[]>;
     selectEasyEdaInstance(instanceId: string): Promise<EasyEdaInstance>;
     getSelectedEasyEdaInstance(): Promise<EasyEdaInstance | undefined>;
+    getSelectedEasyEdaInstanceId?(): string | undefined;
+    getVersionWarning(mcpVersion: string): Promise<string | undefined>;
     enterBrokerOnlyMode(): boolean;
     close(): Promise<void>;
 };
@@ -93,6 +98,7 @@ const BROKER_IDLE_TIMEOUT_MS = Number.isFinite(configuredBrokerIdleMs) && config
     : 60_000;
 
 class OwnerBroker {
+    private readonly proxyCancellations = new WeakMap<WebSocket, Map<string, AbortController>>();
     private readonly easyEdaClients = new Map<string, EasyEdaClient>();
     private readonly pendingEasyEdaRequests = new Map<string, PendingRequest>();
     private readonly sockets = new Set<RoleSocket>();
@@ -137,6 +143,7 @@ class OwnerBroker {
         return [...this.easyEdaClients.values()].map(client => ({
             instanceId: client.instanceId,
             projectName: client.projectName,
+            extensionVersion: client.extensionVersion,
             connectedAt: client.connectedAt,
             lastSeenAt: client.lastSeenAt,
         }));
@@ -150,7 +157,8 @@ class OwnerBroker {
         return true;
     }
 
-    requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = 120_000, targetInstanceId?: string) {
+    requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = commandTimeoutMs(event), targetInstanceId?: string, signal?: AbortSignal) {
+        signal?.throwIfAborted();
         if (this.pendingEasyEdaRequests.size >= MAX_PENDING_REQUESTS) {
             throw new Error(`EasyEDA bridge has too many pending requests (${MAX_PENDING_REQUESTS}).`);
         }
@@ -188,7 +196,14 @@ class OwnerBroker {
             }
         }
 
-        return response;
+        return abortable(response, signal, () => {
+            const pending = this.pendingEasyEdaRequests.get(id);
+            if (!pending) return;
+            clearTimeout(pending.timer);
+            this.pendingEasyEdaRequests.delete(id);
+            trySendWs(client.socket, { event: 'cancel-command', body: JSON.stringify({ id }) });
+            pending.reject(toError(signal?.reason ?? 'Request cancelled'));
+        });
     }
 
     private handleConnection(socket: RoleSocket) {
@@ -279,6 +294,9 @@ class OwnerBroker {
         const projectName = typeof value.projectName === 'string' && value.projectName.trim()
             ? value.projectName.trim()
             : 'Untitled EasyEDA project';
+        const extensionVersion = typeof value.extensionVersion === 'string' && value.extensionVersion.trim()
+            ? value.extensionVersion.trim()
+            : undefined;
 
         const previousInstanceId = socket[INSTANCE_ID];
         if (previousInstanceId && previousInstanceId !== instanceId) {
@@ -303,6 +321,7 @@ class OwnerBroker {
         this.easyEdaClients.set(instanceId, {
             instanceId,
             projectName,
+            extensionVersion,
             socket,
             connectedAt: existing?.connectedAt ?? now,
             lastSeenAt: now,
@@ -332,6 +351,11 @@ class OwnerBroker {
             });
         };
 
+        if (message.event === 'proxy:cancel') {
+            this.proxyCancellations.get(socket)?.get(id)?.abort(new Error('Request cancelled'));
+            return;
+        }
+
         if (message.event === 'proxy:list-easyeda-instances') {
             reply(true, this.listEasyEdaInstances());
             return;
@@ -343,17 +367,31 @@ class OwnerBroker {
                 return;
             }
 
+            let cancellations = this.proxyCancellations.get(socket);
+            if (!cancellations) {
+                cancellations = new Map();
+                this.proxyCancellations.set(socket, cancellations);
+                const owned = cancellations;
+                socket.once('close', () => {
+                    for (const controller of owned.values()) controller.abort(new Error('Proxy disconnected'));
+                    owned.clear();
+                });
+            }
+            const controller = new AbortController();
+            cancellations.set(id, controller);
             try {
                 void this.requestEasyEda(
                     body.event,
                     body.body && typeof body.body === 'object' ? body.body : {},
                     typeof body.timeoutMs === 'number' ? body.timeoutMs : undefined,
                     body.targetInstanceId,
+                    controller.signal,
                 ).then(
                     result => reply(true, result),
                     error => reply(false, undefined, error),
-                ).catch(() => undefined);
+                ).finally(() => cancellations.delete(id)).catch(() => undefined);
             } catch (error) {
+                cancellations.delete(id);
                 reply(false, undefined, error);
             }
         }
@@ -551,20 +589,21 @@ export class ProxyBridge {
         this.socket = undefined;
     }
 
-    listEasyEdaInstances(timeoutMs = 120_000) {
+    listEasyEdaInstances(timeoutMs: number = TIMEOUT_POLICY.commandMs) {
         return this.requestOwner<EasyEdaInstance[]>('proxy:list-easyeda-instances', {}, timeoutMs);
     }
 
-    requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = 120_000, targetInstanceId?: string) {
+    requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = commandTimeoutMs(event), targetInstanceId?: string, signal?: AbortSignal) {
         return this.requestOwner('proxy:request-easyeda', {
             event,
             body,
             timeoutMs,
             targetInstanceId,
-        }, timeoutMs + 1_000);
+        }, timeoutMs + TIMEOUT_POLICY.proxyResponseGraceMs, signal);
     }
 
-    private requestOwner<T = unknown>(event: string, body: Record<string, unknown>, timeoutMs = 120_000) {
+    private requestOwner<T = unknown>(event: string, body: Record<string, unknown>, timeoutMs: number = TIMEOUT_POLICY.commandMs, signal?: AbortSignal) {
+        signal?.throwIfAborted();
         const socket = this.socket;
         if (!socket || socket.readyState !== WebSocket.OPEN) {
             throw new Error('EasyEDA bridge owner is not connected.');
@@ -602,7 +641,14 @@ export class ProxyBridge {
             }
         }
 
-        return response;
+        return abortable(response, signal, () => {
+            const pending = this.pendingProxyRequests.get(id);
+            if (!pending) return;
+            clearTimeout(pending.timer);
+            this.pendingProxyRequests.delete(id);
+            trySendWs(socket, { event: 'proxy:cancel', body: JSON.stringify({ id }) });
+            pending.reject(toError(signal?.reason ?? 'Request cancelled'));
+        });
     }
 
     private handleMessage(message: WsMessage) {
@@ -764,22 +810,28 @@ class MeshBridge implements Bridge {
         });
     }
 
-    async requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = 120_000) {
-        await this.waitForRecoverableConnection();
+    async requestEasyEda(event: string, body: Record<string, unknown> = {}, timeoutMs = commandTimeoutMs(event), signal = currentSignal()) {
+        signal?.throwIfAborted();
+        const target = currentTarget();
+        const instanceId = target?.instanceId ?? this.selectedEasyEdaInstanceId;
+        if (target?.documentUuid) body = { ...body, __easyedaCopilotDocumentUuid: target.documentUuid };
+        await abortable(this.waitForRecoverableConnection(signal, instanceId), signal);
+        signal?.throwIfAborted();
 
         if (this.owner) {
-            return this.owner.requestEasyEda(event, body, timeoutMs, this.selectedEasyEdaInstanceId);
+            return this.owner.requestEasyEda(event, body, timeoutMs, instanceId, signal);
         }
         if (this.proxy) {
-            return this.proxy.requestEasyEda(event, body, timeoutMs, this.selectedEasyEdaInstanceId);
+            return this.proxy.requestEasyEda(event, body, timeoutMs, instanceId, signal);
         }
         throw new Error('EasyEDA bridge is not ready yet.');
     }
 
-    private async waitForRecoverableConnection() {
+    private async waitForRecoverableConnection(signal?: AbortSignal, instanceId = this.selectedEasyEdaInstanceId) {
         const deadline = Date.now() + RECOVERY_WAIT_MS;
 
         while (Date.now() < deadline) {
+            signal?.throwIfAborted();
             if (this.closed) throw new Error('EasyEDA bridge is closed.');
             if (!this.owner && !this.proxy) {
                 await delay(RECOVERY_POLL_MS);
@@ -792,8 +844,8 @@ class MeshBridge implements Bridge {
                     ? this.owner.listEasyEdaInstances()
                     : await this.proxy!.listEasyEdaInstances(Math.min(RECOVERY_PROBE_TIMEOUT_MS, remainingMs));
 
-                if (this.selectedEasyEdaInstanceId) {
-                    if (instances.some(instance => instance.instanceId === this.selectedEasyEdaInstanceId)) return;
+                if (instanceId) {
+                    if (instances.some(instance => instance.instanceId === instanceId)) return;
                 } else if (instances.length > 0) {
                     return;
                 }
@@ -821,10 +873,31 @@ class MeshBridge implements Bridge {
         return instance;
     }
 
+    getSelectedEasyEdaInstanceId() { return this.selectedEasyEdaInstanceId; }
+
     async getSelectedEasyEdaInstance() {
         if (!this.selectedEasyEdaInstanceId) return undefined;
         const instances = await this.listEasyEdaInstances();
         return instances.find(item => item.instanceId === this.selectedEasyEdaInstanceId);
+    }
+
+    async getVersionWarning(mcpVersion: string) {
+        try {
+            const instances = await this.listEasyEdaInstances();
+            const instance = this.selectedEasyEdaInstanceId
+                ? instances.find(item => item.instanceId === this.selectedEasyEdaInstanceId)
+                : instances.length === 1 ? instances[0] : undefined;
+            if (!instance) return undefined;
+            if (!instance.extensionVersion) {
+                return `WARNING: EasyEDA Copilot extension version is unknown. MCP is ${mcpVersion}; update the extension to avoid compatibility issues.`;
+            }
+            if (instance.extensionVersion !== mcpVersion) {
+                return `WARNING: EasyEDA Copilot version mismatch: MCP ${mcpVersion}, extension ${instance.extensionVersion}. Compatibility issues may occur; update the extension.`;
+            }
+        } catch {
+            // Version diagnostics must never turn a successful tool call into an error.
+        }
+        return undefined;
     }
 
     private async becomeOwnerOrProxy(afterFailure: boolean) {

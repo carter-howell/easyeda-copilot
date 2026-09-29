@@ -1,8 +1,4 @@
 import { assembleCircuit, deleteCopilotBlockBoxes } from './eda/assemble';
-import { searchComponentLibraries } from '../../additions/extension/library-search';
-import { deleteBoardWithDocuments } from '../../additions/extension/delete-board';
-import { applyLibraryCircuit } from '../../additions/extension/library-circuit';
-import { CircuitModStruct } from '@copilot/shared/types/circuit';
 import { annotateDesignators } from './eda/annotate-designators';
 import {
     applyRoutingCopper,
@@ -11,7 +7,6 @@ import {
 } from './eda/pcb-assemble';
 import { checkpointer } from './eda/checkpointer';
 import { CheckpointScopes } from './eda/checkpoint-scopes';
-import { interruptJavaScriptExecution } from '../../additions/extension/execute-js-control';
 const checkpointScopes = new CheckpointScopes(checkpointer);
 import { checkPcbDrc } from './eda/drc';
 import { previewPcb } from './eda/pcb-preview';
@@ -23,14 +18,16 @@ import {
     inspectComponent,
     inspectNet,
 } from './eda/pcb';
-import { getSchematic } from './eda/schematic';
+import { getOtherPageSignals, getSchematic } from './eda/schematic';
 import { getSchematicGroups, mergeSchematicGroups } from './eda/schematic-groups';
 import { assertMcpDocumentContext } from './eda/mcp-document-context';
+import { serializeProjectInfo } from './eda/project-info';
 import { estimateSchematicSheetSpace } from './eda/sheet-space';
 import { rmPartFromDesignator, withTimeout } from './eda/utils';
 import '@copilot/shared/types/eda';
 import { ExplainCircuit } from '@copilot/shared/types/circuit';
-import PQueue from 'p-queue';
+import { McpCommandQueue } from './mcp-command-queue';
+import { mcpCommandTimeoutMs, MCP_TIMEOUT_MESSAGE } from './mcp-command-timeout';
 import {
     type PcbDrcBundle,
     type PcbDrcDifferentialPairRule,
@@ -39,6 +36,7 @@ import {
     type PcbDrcNetRule,
     type PcbDrcNetRuleEntry,
 } from '@copilot/shared/types/pcb/drc';
+import extension from '../extension.json';
 
 type DesiredDifferentialPair = {
     name: string;
@@ -57,14 +55,15 @@ const MCP_SCAN_INTERVAL_MS = 5000;
 const MCP_CONNECT_TIMEOUT_MS = 2000;
 const MCP_HEARTBEAT_INTERVAL_MS = 10000;
 const MCP_HEARTBEAT_MAX_MISSES = 3;
-const MCP_COMMAND_QUEUE_MAX_SIZE = 32;
+const MCP_UNTITLED_PROJECT_NAME = 'Untitled EasyEDA project';
+const MCP_COMMAND_QUEUE_MAX_SIZE = 16;
 const MCP_DEADLINE_FIELD = '__easyedaCopilotDeadlineAt';
 const MCP_SCAN_TIMER_ID = 'easyeda-copilot-mcp-scan';
 const MCP_HEARTBEAT_TIMER_ID = 'easyeda-copilot-mcp-heartbeat';
 const MCP_CONNECT_TIMEOUT_TIMER_ID = 'easyeda-copilot-mcp-connect-timeout';
 const RETAINED_ROUTING_APPLICATIONS = 20;
 
-const mcpCommandQueue = new PQueue({ concurrency: 1 });
+const mcpCommandQueue = new McpCommandQueue();
 const routingApplicationCache = new Map<string, Promise<unknown>>();
 
 type McpClientState = {
@@ -81,6 +80,8 @@ type McpClientState = {
     heartbeatTimeout?: ReturnType<typeof setTimeout>;
     heartbeatAwaitingPong: boolean;
     heartbeatMisses: number;
+    currentProjectName?: string;
+    metadataRefreshInFlight?: boolean;
 };
 
 function makeMcpInstanceId() {
@@ -107,6 +108,7 @@ const state = ((eda as typeof eda & {
 state.connectionEpoch ??= 0;
 state.heartbeatAwaitingPong ??= false;
 state.heartbeatMisses ??= 0;
+state.metadataRefreshInFlight ??= false;
 
 function parseBody<T = Record<string, unknown>>(message: McpMessage): T {
     return message.body ? JSON.parse(message.body) as T : {} as T;
@@ -161,6 +163,19 @@ function clearMcpTimeoutTimer(id: string, fallbackTimer?: ReturnType<typeof setT
 
 function delay(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function mcpCommandStep<T>(signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {
+    signal?.throwIfAborted();
+    const result = await action();
+    signal?.throwIfAborted();
+    return result;
+}
+
+async function saveRequiredCheckpoint(name: string, purpose: string, signal?: AbortSignal) {
+    const checkpointId = await mcpCommandStep(signal, () => checkpointer.save(false, name));
+    if (!checkpointId) throw new Error(`Failed to create ${purpose} checkpoint.`);
+    return checkpointId;
 }
 
 const BEAUTIFY_AUXILIARY_COMPONENT_TYPES = new Set<ESCH_PrimitiveComponentType>([
@@ -250,7 +265,6 @@ async function restoreBeautifyComponentIdentities(saved: BeautifyComponentIdenti
 function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
-
 
 function assertDrcBundle(value: unknown): asserts value is PcbDrcBundle {
     if (!isRecord(value) || !isRecord(value.ruleConfiguration) || !Array.isArray(value.netRules)) {
@@ -983,18 +997,22 @@ async function saveCurrentDocument(document: IDMT_EditorDocumentItem) {
     return saveActiveDocument(document.documentType);
 }
 
-async function syncCurrentDocument(settleMs = 500) {
-    const document = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+async function syncCurrentDocument(settleMs = 500, signal?: AbortSignal) {
+    const document = await mcpCommandStep(signal, () => eda.dmt_SelectControl.getCurrentDocumentInfo());
     if (!document) throw new Error('Current document info not found');
 
-    const saved = await saveCurrentDocument(document);
+    const saved = await mcpCommandStep(signal, () => saveCurrentDocument(document));
     if (!saved) throw new Error(`Failed to save current document: ${document.uuid}`);
 
-    const closed = await eda.dmt_EditorControl.closeDocument(document.tabId || document.uuid);
+    const closed = await mcpCommandStep(
+        signal,
+        () => eda.dmt_EditorControl.closeDocument(document.tabId || document.uuid),
+    );
     if (!closed) throw new Error(`Failed to close current document: ${document.uuid}`);
 
     await delay(settleMs);
-    const tabId = await eda.dmt_EditorControl.openDocument(document.uuid);
+    signal?.throwIfAborted();
+    const tabId = await mcpCommandStep(signal, () => eda.dmt_EditorControl.openDocument(document.uuid));
     if (!tabId) throw new Error(`Failed to reopen current document: ${document.uuid}`);
     await delay(settleMs);
 
@@ -1084,11 +1102,36 @@ function markMcpDisconnected(reason: string) {
     state.connectionEpoch++;
     state.isRegistered = false;
     state.isConnecting = false;
-    mcpCommandQueue.clear();
+    clearMcpCommands();
     clearConnectTimeout();
     stopHeartbeat();
     closeMcpSocket(reason);
     eda.sys_Log.add(`MCP disconnected: ${reason}`, ESYS_LogType.WARNING);
+}
+
+function sendEasyEdaMetadata(projectName: string) {
+    send('easyeda:hello', {
+        instanceId: state.instanceId,
+        projectName,
+        extensionVersion: extension.version,
+    });
+}
+
+async function refreshEasyEdaMetadata(connectionEpoch: number, force = false) {
+    if (connectionEpoch !== state.connectionEpoch || !state.isRegistered || state.metadataRefreshInFlight) return;
+    state.metadataRefreshInFlight = true;
+    try {
+        const projectInfo = await eda.dmt_Project.getCurrentProjectInfo();
+        if (connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
+        const currentName = typeof projectInfo?.friendlyName === 'string' && projectInfo.friendlyName.trim()
+            ? projectInfo.friendlyName.trim()
+            : MCP_UNTITLED_PROJECT_NAME;
+        if (!force && currentName === state.currentProjectName) return;
+        state.currentProjectName = currentName;
+        sendEasyEdaMetadata(currentName);
+    } finally {
+        state.metadataRefreshInFlight = false;
+    }
 }
 
 function sendHeartbeatPing(connectionEpoch: number) {
@@ -1107,6 +1150,9 @@ function sendHeartbeatPing(connectionEpoch: number) {
 
     try {
         send('ping', { ts: Date.now() });
+        void refreshEasyEdaMetadata(connectionEpoch).catch(error => {
+            eda.sys_Log.add(`MCP metadata refresh failed: ${(error as Error).message}`, ESYS_LogType.WARNING);
+        });
     } catch (error) {
         markMcpDisconnected(`heartbeat send failed: ${(error as Error).message}`);
         return;
@@ -1126,67 +1172,7 @@ function startHeartbeat(connectionEpoch: number) {
 async function getProjectInfo() {
     const projectInfo = await eda.dmt_Project.getCurrentProjectInfo();
     if (!projectInfo) throw new Error('Current project info not found');
-
-    const project_data = [];
-
-    const filterSchPage = (page: IDMT_SchematicPageItem) => {
-        return {
-            name: page.name,
-            itemType: page.itemType,
-            uuid: page.uuid
-        }
-    };
-
-    const filterSch = (sch: IDMT_SchematicItem | null | undefined) => {
-        if (!sch) return null;
-        return {
-            name: sch.name,
-            itemType: sch.itemType,
-            page: sch.page.map(filterSchPage),
-            uuid: sch.uuid
-        }
-    };
-
-    for (const item of projectInfo.data) {
-        if (item.itemType === EDMT_ItemType.BOARD) {
-
-            project_data.push({
-                name: item.name,
-                itemType: item.itemType,
-                schematic: filterSch(item.schematic),
-                pcb: item.pcb ? {
-                    name: item.pcb.name,
-                    itemType: item.pcb.itemType,
-                    uuid: item.pcb.uuid,
-                    parentBoardName: item.pcb.parentBoardName
-                } : null,
-            })
-        }
-        else if (item.itemType === EDMT_ItemType.SCHEMATIC) {
-            project_data.push({
-                name: item.name,
-                itemType: item.itemType,
-                page: filterSch(item)!.page,
-                uuid: item.uuid,
-                parentBoardUuid: item.parentBoardUuid
-            })
-        }
-        else if (item.itemType === EDMT_ItemType.PCB) {
-            project_data.push({
-                name: item.name,
-                itemType: item.itemType,
-                uuid: item.uuid,
-                parentBoardName: item.parentBoardName
-            })
-        }
-    }
-
-    return {
-        project_data,
-        project_uuid: projectInfo.uuid,
-        project_name: projectInfo.friendlyName,
-        description: projectInfo.description
-    };
+    return serializeProjectInfo(projectInfo, EDMT_ItemType);
 }
 
 type ProjectTreeFolder = {
@@ -1285,26 +1271,12 @@ async function getAllProjectsTree(): Promise<ProjectTreeTeam[]> {
 
 async function sendEasyEdaHello(connectionEpoch: number) {
     if (connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
-    let projectName = 'Untitled EasyEDA project';
-
-    send('easyeda:hello', {
-        instanceId: state.instanceId,
-        projectName,
-    });
-
+    sendEasyEdaMetadata(state.currentProjectName ?? MCP_UNTITLED_PROJECT_NAME);
     try {
-        projectName = (await getProjectInfo()).project_name || projectName;
+        await refreshEasyEdaMetadata(connectionEpoch, true);
     } catch {
         // The project may not be fully available immediately after EasyEDA startup.
-        return;
     }
-
-    if (connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
-
-    send('easyeda:hello', {
-        instanceId: state.instanceId,
-        projectName,
-    });
 }
 
 const findDocWithUUID = (data: Awaited<ReturnType<typeof getProjectInfo>>['project_data'], uuid: string) => {
@@ -1364,7 +1336,7 @@ async function readAllSchematicPages<T>(readPage: () => Promise<T>): Promise<T[]
     }
 }
 
-async function handleMessage(message: McpMessage, connectionEpoch: number) {
+async function handleMessage(message: McpMessage, connectionEpoch: number, signal?: AbortSignal) {
     if (connectionEpoch !== state.connectionEpoch) return;
     state.heartbeatAwaitingPong = false;
     state.heartbeatMisses = 0;
@@ -1382,8 +1354,10 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
     const body = parseBody<{ id?: string } & Record<string, unknown>>(message);
     const id = body.id;
 
+    let replied = false;
     const reply = (ok: boolean, result?: unknown, error?: unknown) => {
-        if (!id || connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
+        if (replied || signal?.aborted || !id || connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
+        replied = true;
         send(`${message.event}:result`, {
             id,
             ok,
@@ -1394,14 +1368,21 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
     try {
         eda.sys_Log.add(`MCP event: ${message.event}`, ESYS_LogType.INFO);
-        await assertMcpDocumentContext(message.event, body);
+        await mcpCommandStep(signal, () => assertMcpDocumentContext(message.event, body));
+
+        if (message.event === 'get-command-target') {
+            const document = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+            if (!document?.uuid) throw new Error('Open the target document first.');
+            reply(true, { documentUuid: document.uuid });
+            return;
+        }
 
         if (message.event === 'execute-js') {
             if (typeof body.code !== 'string') throw new Error('JavaScript code must be a string.');
             const inputs = body.inputs ?? {};
             if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)
                 || Object.values(inputs).some(value => typeof value !== 'string')) throw new Error('JavaScript inputs must be named strings.');
-            reply(true, await checkpointScopes.execute({ code: body.code, inputs: inputs as Record<string, string>, checkpointScope: body.checkpointScope }, eda, connectionEpoch));
+            reply(true, await checkpointScopes.execute({ code: body.code, inputs: inputs as Record<string, string>, checkpointScope: body.checkpointScope }, eda, connectionEpoch, signal));
             return;
         }
 
@@ -1415,15 +1396,20 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
         if (message.event === 'get-schematic') {
             const primitiveIds = await eda.sch_PrimitiveComponent.getAllPrimitiveId().catch(() => []);
-            const schematic = await getSchematic([...primitiveIds], { disableExtractPos: true });
+            const schematic = await getSchematic([...primitiveIds], { disableExtractPos: true, includePortStyles: body.includePortStyles === true });
             reply(true, schematic);
+            return;
+        }
+
+        if (message.event === 'get-other-page-signals') {
+            reply(true, await getOtherPageSignals());
             return;
         }
 
         if (message.event === 'annotate-designators') {
             const mode = body.mode;
             if (mode !== 'preserve' && mode !== 'resequence') throw new Error('Invalid annotation mode.');
-            reply(true, await annotateDesignators(mode));
+            reply(true, await annotateDesignators(mode, signal));
             return;
         }
 
@@ -1500,13 +1486,19 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
                     // DRC, selective copper deletion, new geometry, refill, and native
                     // verification share one recovery boundary.
-                    const checkpointId = await checkpointer.save(false, 'Before PCB routing');
-                    if (!checkpointId) throw new Error('Failed to create routing transaction checkpoint.');
+                    const checkpointId = await saveRequiredCheckpoint(
+                        'Before PCB routing',
+                        'routing transaction',
+                        signal,
+                    );
+                    const step = <T>(action: () => Promise<T>) => mcpCommandStep(signal, async () => {
+                        await assertMcpDocumentContext(message.event, body);
+                        return action();
+                    });
                     try {
-                        const rules = bundle === undefined ? undefined : await routingTransactionStep(
-                            'DRC rule application',
-                            () => applyPcbDrcRules(bundle),
-                        );
+                        const rules = bundle === undefined ? undefined : await step(() => (
+                            routingTransactionStep('DRC rule application', () => applyPcbDrcRules(bundle))
+                        ));
                         const hasBoardMutation = Boolean(
                             application.copperLayerCount !== undefined
                             || application.clearRouting
@@ -1515,28 +1507,27 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
                             || application.zones.length,
                         );
                         const copper = hasBoardMutation
-                            ? await routingTransactionStep(
-                                'board application',
-                                () => applyRoutingCopper(application),
-                            )
+                            ? await step(() => (
+                                routingTransactionStep('board application', () => applyRoutingCopper(application))
+                            ))
                             : undefined;
-                        await routingTransactionStep(
-                            'document synchronization',
-                            () => syncCurrentDocument(),
-                        );
-                        const drc = await routingTransactionStep(
-                            'native DRC verification',
-                            () => checkPcbDrc(1),
-                        );
+                        await step(() => (
+                            routingTransactionStep('document synchronization', () => syncCurrentDocument(500, signal))
+                        ));
+                        const drc = await step(() => (
+                            routingTransactionStep('native DRC verification', () => checkPcbDrc(1))
+                        ));
                         const hasViolations = drc.some(category => category.list.some(group => group.list.length));
                         return {
                             applied: true,
+                            checkpointId,
                             rulesApplied: Boolean(rules),
                             boardApplied: Boolean(copper),
                             ...(copper?.zoneRebuild ? { pours: copper.zoneRebuild } : {}),
                             nativeVerification: hasViolations ? 'failed' : 'passed',
                         };
                     } catch (error) {
+                        if (signal?.aborted) throw error;
                         const restored = await checkpointer.restore(checkpointId, true).catch(() => false);
                         const message = error instanceof Error ? error.message : String(error);
                         throw new Error(restored ? `${message}; routing transaction rolled back` : `${message}; routing rollback failed`);
@@ -1620,8 +1611,8 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
                 : '';
             if (!projectUuid) throw new Error('Missing projectUuid');
 
-            const savedDocuments = await saveAllOpenDocuments();
-            const opened = await eda.dmt_Project.openProject(projectUuid);
+            const savedDocuments = await mcpCommandStep(signal, () => saveAllOpenDocuments());
+            const opened = await mcpCommandStep(signal, () => eda.dmt_Project.openProject(projectUuid));
             if (!opened) throw new Error(`EasyEDA failed to open project: ${projectUuid}`);
 
             reply(true, {
@@ -1647,10 +1638,10 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
         }
 
         if (message.event === 'save-document') {
-            const document = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+            const document = await mcpCommandStep(signal, () => eda.dmt_SelectControl.getCurrentDocumentInfo());
             if (!document) throw new Error('Current document info not found');
 
-            const saved = await saveCurrentDocument(document);
+            const saved = await mcpCommandStep(signal, () => saveCurrentDocument(document));
             if (!saved) throw new Error(`Failed to save current document: ${document.uuid}`);
 
             reply(true, {
@@ -1665,7 +1656,7 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             const settleMs = typeof body.settleMs === 'number' && Number.isFinite(body.settleMs)
                 ? Math.max(0, body.settleMs)
                 : 500;
-            reply(true, await syncCurrentDocument(settleMs));
+            reply(true, await syncCurrentDocument(settleMs, signal));
             return;
         }
 
@@ -1704,24 +1695,6 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             const result = await inspectComponent(pcb, designator, radius);
             reply(true, result);
             return;
-        }
-
-        if (message.event === 'interrupt-execute-js') {
-            const reason = typeof body.reason === 'string' && body.reason.trim()
-                ? body.reason.trim()
-                : 'Interrupted by MCP client';
-            reply(true, interruptJavaScriptExecution(reason));
-            return;
-        }
-
-        if (message.event === 'component-library-search') {
-            const result = await searchComponentLibraries(body);
-            reply(true, result);
-            return;
-        }
-
-        if (message.event === 'apply-library-circuit') {
-            return reply(true, await applyLibraryCircuit(CircuitModStruct().parse(body)));
         }
 
         if (message.event === 'create-schematic') {
@@ -1763,21 +1736,21 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
                 throw new Error('Missing uuid');
             }
 
-            const projectData = await getProjectInfo().then(d => d.project_data);
+            const projectData = await mcpCommandStep(signal, () => getProjectInfo().then(d => d.project_data));
             const doc = findDocWithUUID(projectData, uuid);
 
             if (!doc) return reply(false, undefined, "Not found doc with this uuid");
 
             if (doc.itemType === EDMT_ItemType.SCHEMATIC) {
-                const success = await eda.dmt_Schematic.modifySchematicName(uuid, name);
+                const success = await mcpCommandStep(signal, () => eda.dmt_Schematic.modifySchematicName(uuid, name));
                 reply(true, { success, new_sch_name: name });
             }
             else if (doc.itemType === EDMT_ItemType.SCHEMATIC_PAGE) {
-                const success = await eda.dmt_Schematic.modifySchematicPageName(uuid, name);
+                const success = await mcpCommandStep(signal, () => eda.dmt_Schematic.modifySchematicPageName(uuid, name));
                 return reply(true, { success, new_sch_page_name: name });
             }
             else if (doc.itemType === EDMT_ItemType.PCB) {
-                const success = await eda.dmt_Pcb.modifyPcbName(uuid, name);
+                const success = await mcpCommandStep(signal, () => eda.dmt_Pcb.modifyPcbName(uuid, name));
                 return reply(true, { success, new_pcb_name: name });
             }
 
@@ -1797,12 +1770,8 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
 
         if (message.event === 'delete-doc') {
             if (typeof body.board_name === 'string') {
-                return reply(true, await deleteBoardWithDocuments(body.board_name, {
-                    boards: () => eda.dmt_Board.getAllBoardsInfo(),
-                    deleteBoard: name => eda.dmt_Board.deleteBoard(name),
-                    deleteSchematic: uuid => eda.dmt_Schematic.deleteSchematic(uuid),
-                    deletePcb: uuid => eda.dmt_Pcb.deletePcb(uuid),
-                }));
+                const success = await mcpCommandStep(signal, () => eda.dmt_Board.deleteBoard(body.board_name as string));
+                return reply(true, { success });
             }
 
             const uuid = body.uuid;
@@ -1811,21 +1780,21 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
                 throw new Error('Missing uuid');
             }
 
-            const projectData = await getProjectInfo().then(d => d.project_data);
+            const projectData = await mcpCommandStep(signal, () => getProjectInfo().then(d => d.project_data));
             const doc = findDocWithUUID(projectData, uuid);
 
             if (!doc) return reply(false, undefined, "Not found doc with this uuid");
 
             if (doc.itemType === EDMT_ItemType.SCHEMATIC) {
-                const success = await eda.dmt_Schematic.deleteSchematic(uuid);
-                return reply(true, { success });
+                const success = await mcpCommandStep(signal, () => eda.dmt_Schematic.deleteSchematic(uuid));
+                reply(true, { success });
             }
             else if (doc.itemType === EDMT_ItemType.SCHEMATIC_PAGE) {
-                const success = await eda.dmt_Schematic.deleteSchematicPage(uuid);
+                const success = await mcpCommandStep(signal, () => eda.dmt_Schematic.deleteSchematicPage(uuid));
                 return reply(true, { success });
             }
             else if (doc.itemType === EDMT_ItemType.PCB) {
-                const success = await eda.dmt_Pcb.deletePcb(uuid);
+                const success = await mcpCommandStep(signal, () => eda.dmt_Pcb.deletePcb(uuid));
                 return reply(true, { success });
             }
 
@@ -1846,20 +1815,19 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             const schematicUuid = typeof body.schematicUuid === 'string' ? body.schematicUuid : undefined;
 
             const success = await eda.pcb_Document.importChanges(schematicUuid);
-            return reply(success, {
-                success,
-                message: success
-                    ? 'EasyEDA opened the PCB import flow.'
-                    : 'Failed to import schematic changes into PCB.',
-            });
+            if (success) return reply(true, { success, message: `In EasyEDA, when importing changes, the import dialog window opens if there are changes, or it does not open if there are no changes. In either case, the user must manually confirm the action within that dialog window (if it appears) to complete the import process.` });
+            return reply(true, { success });
         }
 
         if (message.event === 'assemble-circuit') {
             const circuit = body.circuit;
             if (!circuit) throw new Error('Missing circuit in assemble-circuit body');
 
-            await checkpointer.save(false, 'Before schematic assembly');
-            await assembleCircuit(circuit as Parameters<typeof assembleCircuit>[0]);
+            const checkpointId = await saveRequiredCheckpoint('Before schematic assembly', 'schematic assembly', signal);
+            await mcpCommandStep(
+                signal,
+                () => assembleCircuit(circuit as Parameters<typeof assembleCircuit>[0], signal),
+            );
             const sheetSpace = await withTimeout(
                 estimateSchematicSheetSpace(),
                 5000,
@@ -1871,7 +1839,7 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
                 );
                 return undefined;
             });
-            reply(true, { assembled: true, ...(sheetSpace ? { sheetSpace } : {}) });
+            reply(true, { assembled: true, checkpointId, ...(sheetSpace ? { sheetSpace } : {}) });
             return;
         }
 
@@ -1886,48 +1854,74 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             if (!checkpointId) throw new Error('Missing checkpointId in beautify-current-page body');
             if (!expectedDesignators.length) throw new Error('Missing expectedDesignators in beautify-current-page body');
 
-            const checkpoint = await checkpointer.read(checkpointId);
+            const checkpoint = await mcpCommandStep(signal, () => checkpointer.read(checkpointId));
             if (!checkpoint) throw new Error(`Checkpoint not found: ${checkpointId}`);
 
-            const currentPage = await eda.dmt_Schematic.getCurrentSchematicPageInfo().catch(() => undefined);
-            if (checkpoint.pageId && checkpoint.pageId !== currentPage?.uuid) {
+            const currentPage = await mcpCommandStep(
+                signal,
+                () => eda.dmt_Schematic.getCurrentSchematicPageInfo().catch(() => undefined),
+            );
+            if (!checkpoint.pageId || checkpoint.pageId !== currentPage?.uuid) {
                 throw new Error('The current schematic page changed after the beautify checkpoint was created.');
             }
 
             let mutationStarted = false;
             try {
-                const componentIdentities = await getBeautifyComponentIdentities(expectedDesignators);
+                const componentIdentities = await mcpCommandStep(
+                    signal,
+                    () => getBeautifyComponentIdentities(expectedDesignators),
+                );
                 mutationStarted = true;
 
-                await deleteCopilotBlockBoxes();
+                await mcpCommandStep(signal, () => deleteCopilotBlockBoxes());
 
-                const wireIds = await eda.sch_PrimitiveWire.getAllPrimitiveId().then(ids => [...ids]);
+                const wireIds = await mcpCommandStep(
+                    signal,
+                    () => eda.sch_PrimitiveWire.getAllPrimitiveId().then(ids => [...ids]),
+                );
                 if (wireIds.length) {
-                    const deleted = await eda.sch_PrimitiveWire.delete(wireIds);
+                    const deleted = await mcpCommandStep(signal, () => eda.sch_PrimitiveWire.delete(wireIds));
                     if (!deleted) throw new Error('Failed to delete all schematic wires.');
                 }
 
-                const componentIds = await getBeautifyComponentIds(expectedDesignators);
+                const componentIds = await mcpCommandStep(
+                    signal,
+                    () => getBeautifyComponentIds(expectedDesignators),
+                );
                 if (componentIds.length) {
-                    const deleted = await eda.sch_PrimitiveComponent.delete(componentIds);
+                    const deleted = await mcpCommandStep(
+                        signal,
+                        () => eda.sch_PrimitiveComponent.delete(componentIds),
+                    );
                     if (!deleted) throw new Error('Failed to delete all schematic components.');
                 }
 
-                const [remainingWireIds, remainingComponentIds] = await Promise.all([
+                const [remainingWireIds, remainingComponentIds] = await mcpCommandStep(signal, () => Promise.all([
                     eda.sch_PrimitiveWire.getAllPrimitiveId(),
                     getBeautifyComponentIds(expectedDesignators),
-                ]);
+                ]));
                 if (remainingWireIds.length || remainingComponentIds.length) {
                     throw new Error(`Failed to clear the schematic page completely: ${remainingWireIds.length} wires and ${remainingComponentIds.length} components remain.`);
                 }
 
-                await assembleCircuit(circuit as Parameters<typeof assembleCircuit>[0]);
-                await waitForBeautifyComponents(expectedDesignators);
-                await restoreBeautifyComponentIdentities(componentIdentities);
+                await mcpCommandStep(
+                    signal,
+                    () => assembleCircuit(circuit as Parameters<typeof assembleCircuit>[0], signal),
+                );
+                await mcpCommandStep(signal, () => waitForBeautifyComponents(expectedDesignators));
+                await mcpCommandStep(signal, () => restoreBeautifyComponentIdentities(componentIdentities));
 
-                reply(true, { assembled: true, checkpointId });
+                const sheetSpace = await withTimeout(
+                    estimateSchematicSheetSpace(),
+                    5000,
+                    'Schematic sheet space estimate timeout',
+                ).catch(error => {
+                    eda.sys_Log.add(`Schematic sheet space estimate failed: ${(error as Error).message}`, ESYS_LogType.WARNING);
+                    return undefined;
+                });
+                reply(true, { assembled: true, checkpointId, ...(sheetSpace ? { sheetSpace } : {}) });
             } catch (error) {
-                if (mutationStarted) {
+                if (mutationStarted && !signal?.aborted) {
                     const restored = await checkpointer.restore(checkpointId, true).catch(() => false);
                     if (!restored) {
                         const message = error instanceof Error ? error.message : String(error);
@@ -1943,9 +1937,12 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
             const board = body.boardAssemble ?? body.board ?? body.pcb_board_assemble;
             if (!board) throw new Error('Missing board assemble payload in assemble-board body');
 
-            await checkpointer.save(false, 'Before PCB placement');
-            await assembleBoard(board as Parameters<typeof assembleBoard>[0]);
-            reply(true, { assembled: true });
+            const checkpointId = await saveRequiredCheckpoint('Before PCB placement', 'PCB placement', signal);
+            await mcpCommandStep(
+                signal,
+                () => assembleBoard(board as Parameters<typeof assembleBoard>[0], signal),
+            );
+            reply(true, { assembled: true, checkpointId });
             return;
         }
 
@@ -1976,7 +1973,11 @@ async function handleMessage(message: McpMessage, connectionEpoch: number) {
         }
 
         if (message.event === 'checkpoint-restore') {
-            const restored = await checkpointer.restore(typeof body.checkpointId === 'string' ? body.checkpointId : undefined, true);
+            const restored = await checkpointer.restore(
+                typeof body.checkpointId === 'string' ? body.checkpointId : undefined,
+                true,
+                signal,
+            );
             reply(true, { restored });
             return;
         }
@@ -2008,7 +2009,35 @@ function replyMcpQueueFull(message: McpMessage, connectionEpoch: number) {
     );
 }
 
-async function handleQueuedMcpMessage(message: McpMessage, connectionEpoch: number) {
+const commandControllers = new Map<string, AbortController>();
+
+function cancelMcpCommand(message: McpMessage) {
+    const { id } = parseBody<{ id?: string }>(message);
+    if (id) commandControllers.get(id)?.abort(new Error('MCP request cancelled'));
+}
+
+function clearMcpCommands() {
+    for (const controller of commandControllers.values()) controller.abort(new Error('MCP connection closed'));
+    commandControllers.clear();
+    mcpCommandQueue.clear();
+}
+
+function enqueueMcpCommand(message: McpMessage, connectionEpoch: number) {
+    const { id } = parseBody<{ id?: string }>(message);
+    if (!id || commandControllers.has(id)) return;
+    const controller = new AbortController();
+    commandControllers.set(id, controller);
+    return mcpCommandQueue.add(
+        () => handleQueuedMcpMessage(message, connectionEpoch, controller.signal),
+        { signal: controller.signal },
+    ).catch(error => {
+        if (!controller.signal.aborted) throw error;
+    }).finally(() => {
+        if (commandControllers.get(id) === controller) commandControllers.delete(id);
+    });
+}
+
+async function handleQueuedMcpMessage(message: McpMessage, connectionEpoch: number, parentSignal?: AbortSignal) {
     if (connectionEpoch !== state.connectionEpoch || !state.isRegistered) return;
 
     const body = parseBody<Record<string, unknown>>(message);
@@ -2019,7 +2048,18 @@ async function handleQueuedMcpMessage(message: McpMessage, connectionEpoch: numb
         return;
     }
 
-    await handleMessage(message, connectionEpoch);
+    try {
+        await withTimeout(
+            signal => handleMessage(message, connectionEpoch, signal),
+            mcpCommandTimeoutMs(message.event, deadlineAt),
+            MCP_TIMEOUT_MESSAGE,
+            parentSignal,
+        );
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        eda.sys_Log.add(`MCP event stopped: ${message.event}: ${detail}`, ESYS_LogType.ERROR);
+        replyMcpError(message, detail, connectionEpoch);
+    }
 }
 
 function clearConnectTimeout() {
@@ -2049,7 +2089,7 @@ function tryConnectMcp(showErrors = false) {
         if (connectionEpoch !== state.connectionEpoch) return;
         state.connectionEpoch++;
         state.isConnecting = false;
-        mcpCommandQueue.clear();
+        clearMcpCommands();
         clearConnectTimeout();
         closeMcpSocket('MCP connect timeout');
 
@@ -2068,8 +2108,12 @@ function tryConnectMcp(showErrors = false) {
                 const data = typeof event.data === 'string' ? event.data : String(event.data);
                 const message = JSON.parse(data) as McpMessage;
 
-                if (message.event === 'connected' || message.event === 'pong'
-                    || message.event === 'interrupt-execute-js') {
+                if (message.event === 'cancel-command') {
+                    cancelMcpCommand(message);
+                    return;
+                }
+
+                if (message.event === 'connected' || message.event === 'pong') {
                     await handleMessage(message, connectionEpoch);
                     return;
                 }
@@ -2079,7 +2123,7 @@ function tryConnectMcp(showErrors = false) {
                     return;
                 }
 
-                void mcpCommandQueue.add(() => handleQueuedMcpMessage(message, connectionEpoch)).catch(error => {
+                void enqueueMcpCommand(message, connectionEpoch)?.catch(error => {
                     eda.sys_Log.add(`MCP queued command error: ${(error as Error).message}`, ESYS_LogType.ERROR);
                 });
             } catch (error) {
@@ -2149,7 +2193,7 @@ export function stopMcpScan(showToast = true) {
     state.isUserPaused = true;
     clearConnectTimeout();
     stopHeartbeat();
-    mcpCommandQueue.clear();
+    clearMcpCommands();
 
     clearMcpIntervalTimer(MCP_SCAN_TIMER_ID, state.scanTimer);
     state.scanTimer = undefined;

@@ -1,12 +1,14 @@
 import type { CircuitAssembly, ExplainCircuit } from '@copilot/shared/types/circuit';
+import { readComponentProperties, readPartUuidFromPrimitive, resolvedPartUuid } from './component-part-ref';
+import { readProjectDeviceRefs } from './project-device-refs';
+import { getPartUuid } from '@copilot/shared/types/lcsc';
 import { searchComponentInSCH } from './search';
 import { getBBox, getPrimitiveById, normalizeWireLine, to2, withTimeout } from './utils';
-import { getCatalogDeviceId } from '../../../additions/extension/catalog-device-id';
+import { readPortStyles, type PinContact } from './port-styles';
 
 let lastToastTime = 0;
 const TOAST_THROTTLE_MS = 8000;
 const SEARCH_BY_CODES_CHUNK_SIZE = 50;
-
 function getFootprintNameFromOtherProperty(otherProperty?: Record<string, unknown> | null) {
     const footprint = Object.entries(otherProperty ?? {}).find(([key, value]) => {
         return key.toLowerCase().includes('footprint') && value !== null && value !== undefined && value.toString().trim();
@@ -129,7 +131,37 @@ function parseAllegroNetlist(netlistText: string, allowedSignalNames?: Set<strin
     return pinToSignal;
 }
 
-export async function getSchematic(primitiveIds?: string[], options?: { disableExtractPartUuid?: boolean, extractFootprintUuid?: boolean, disableExtractPos?: boolean, }) {
+export function signalsOnOtherPages(netlistText: string, currentPagePinRefs: ReadonlySet<string>) {
+    const signals = new Set<string>();
+    for (const [pinRef, signal] of parseAllegroNetlist(netlistText)) {
+        if (!currentPagePinRefs.has(pinRef) && signal && !signal.startsWith('$') && !/^nc$/i.test(signal)) {
+            signals.add(signal);
+        }
+    }
+    return [...signals];
+}
+
+export async function getOtherPageSignals() {
+    let netlistText = await eda.sch_ManufactureData.getNetlistFile(undefined, ESYS_NetlistType.ALLEGRO)
+        .then(file => file?.text()).catch(() => undefined);
+    if (!netlistText && typeof eda?.sch_Netlist?.getNetlist === 'function') {
+        netlistText = await eda.sch_Netlist.getNetlist(ESYS_NetlistType.ALLEGRO).catch(() => undefined);
+    }
+    if (!netlistText) throw new Error('Failed export netlist');
+
+    const currentPagePinRefs = new Set<string>();
+    for (const component of await eda.sch_PrimitiveComponent.getAll()) {
+        if (component.getState_PrimitiveType() !== ESCH_PrimitiveType.COMPONENT) continue;
+        const designator = component.getState_Designator();
+        if (!designator || (designator.includes('|') && designator.length > 4)) continue;
+        const pins = await eda.sch_PrimitiveComponent.getAllPinsByPrimitiveId(component.getState_PrimitiveId());
+        if (!pins) throw new Error(`Failed to read pins of ${designator}`);
+        for (const pin of pins) currentPagePinRefs.add(`${designator}.${pin.getState_PinNumber()}`);
+    }
+    return signalsOnOtherPages(netlistText, currentPagePinRefs);
+}
+
+export async function getSchematic(primitiveIds?: string[], options?: { disableExtractPartUuid?: boolean, extractFootprintUuid?: boolean, disableExtractPos?: boolean, includePortStyles?: boolean }) {
     const docType = await eda.dmt_SelectControl.getCurrentDocumentInfo().then(d => d?.documentType).catch(_ => undefined);
 
     if (docType !== EDMT_EditorDocumentType.SCHEMATIC_PAGE) {
@@ -176,6 +208,7 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
     }
 
     const componentsMap: Map<string, ExplainCircuit['components'][0] & { code?: string }> = new Map();
+    const pinContacts: PinContact[] = [];
 
     for (const id of primitiveIds) {
         const primitiveComponent: ISCH_PrimitiveComponent | ISCH_PrimitiveComponent$1 | undefined = await getPrimitiveById(id).then(r => Array.isArray(r) ? r[0] : r).catch(err => null);
@@ -208,7 +241,7 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
 
         const name = primitiveComponent.getState_Name() ?? '';
 
-        const otherProperty = primitiveComponent.getState_OtherProperty();
+        const otherProperty = readComponentProperties(primitiveComponent);
 
         if (name.includes("Manufacturer Part")) {
             value = primitiveComponent.getState_ManufacturerId() ?? '';
@@ -245,13 +278,20 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
                     name: pinName,
                     signal_name: signalName,
                 });
+                if (options?.includePortStyles && signalName) {
+                    try {
+                        pinContacts.push({
+                            designator, pin_number: pinNumber, signal_name: signalName,
+                            x: p.getState_X(), y: p.getState_Y(),
+                        });
+                    } catch { /* Optional style lookup must not affect schematic extraction. */ }
+                }
             }
         }
 
         const component_ = {
             designator,
-            part_uuid: getCatalogDeviceId(otherProperty, primitiveComponent.getState_Component()?.uuid),
-            library_uuid: primitiveComponent.getState_Component()?.libraryUuid,
+            part_uuid: readPartUuidFromPrimitive(primitiveComponent),
             pins: [...(component?.pins ?? []), ...pins],
             value,
             pos: {
@@ -316,6 +356,22 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
         }
     }
 
+    // Keep the legacy LCSC path first for unmarked components. Export is only
+    // needed for local IDs that neither stored metadata nor supplier lookup resolves.
+    for (const component of componentsMap.values()) {
+        if (!resolvedPartUuid(component.part_uuid) && component.code) {
+            const original = resolvedPartUuid(deviceByLcscId.get(component.code)?.uuid);
+            if (original) component.part_uuid = original;
+        }
+    }
+    const needsProjectRefs = !options?.disableExtractPartUuid && [...componentsMap.values()]
+        .some(component => component.part_uuid && !resolvedPartUuid(component.part_uuid));
+    const projectRefs = needsProjectRefs ? await readProjectDeviceRefs() : new Map();
+    for (const component of componentsMap.values()) {
+        const original = component.part_uuid && projectRefs.get(getPartUuid(component.part_uuid));
+        if (original) component.part_uuid = original;
+    }
+
     const components: ExplainCircuit['components'] = [...componentsMap.values()].map(component => {
         const device = component.code ? deviceByLcscId.get(component.code) : null;
 
@@ -323,8 +379,7 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
             designator: component.designator,
             pins: component.pins,
             value: component.value,
-            part_uuid: device?.uuid ?? component.part_uuid,
-            library_uuid: device ? undefined : component.library_uuid,
+            part_uuid: options?.disableExtractPartUuid ? null : resolvedPartUuid(component.part_uuid),
         };
 
         if (component.footprint_uuid) {
@@ -344,6 +399,14 @@ export async function getSchematic(primitiveIds?: string[], options?: { disableE
 
         return comp;
     });
+
+    if (options?.includePortStyles && pinContacts.length) {
+        const styles = await readPortStyles(pinContacts);
+        for (const component of components) for (const pin of component.pins) {
+            const style = styles.get(`${component.designator}.${pin.pin_number}`);
+            if (style) pin.port_style = style;
+        }
+    }
 
     const explainCircuit: ExplainCircuit = { components };
 
@@ -389,7 +452,7 @@ export async function getAsmCircuit(primitiveIds?: string[]): Promise<CircuitAss
 
         circuit.components.push({
             designator,
-            part_uuid: shortSymbol.getState_Component()?.uuid ?? null,
+            part_uuid: readPartUuidFromPrimitive(shortSymbol),
             pins: [{
                 name: '',
                 pin_number: 1,

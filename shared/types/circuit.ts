@@ -1,12 +1,12 @@
 import { z } from "zod";
+import { PartUuidStruct } from "./lcsc";
 import { ReusedCategory, ReusedTags } from "./reused";
-
-const LibraryDeviceId = () => z.string().regex(/^(?:[0-9a-f]{16}|[0-9a-f]{32}|deviceFromSTD\[[0-9a-f]{32}\])$/);
 
 export const PinSchema = () => z.object({
     pin_number: z.union([z.number(), z.string()]).describe('Pin number.'),
     name: z.string().describe('Pin name (e.g., "VCC").'),
     signal_name: z.string().describe('The name of the signal the pin is connected to. (Name only). The signal name assigned to the pin must be identical to the signal name of the target output.'),
+    port_style: z.enum(['in', 'out', 'bi']).optional().describe('Optional appearance of a generated net port at this connection. Ignored for power and ground.'),
 });
 
 export const BaseComponentSchema = () => z.object({
@@ -15,8 +15,7 @@ export const BaseComponentSchema = () => z.object({
     pins: z.array(PinSchema()).describe('Pin details.'),
     block_name: z.string().describe('Reference to the block.'),
     search_query: z.string().describe('A component search question. For example: "1k 1W smd resistor", "LM358", "2-pin power connector"'),
-    part_uuid: LibraryDeviceId().nullable().describe('Device ID returned by component_search.'),
-    library_uuid: z.string().min(1).optional().describe('Exact libraryUuid returned by component_search; required for non-LCSC library devices.')
+    part_uuid: PartUuidStruct().nullable().describe("Resolved EasyEDA device reference. A string means an LCSC device; other libraries use { uuid, libraryUuid }.")
 });
 
 export const CircuitReusedBlockSchema = () => z.object({
@@ -117,6 +116,7 @@ export const CircuitAssemblyStruct = () => z.object({
     assembly_options: z.object({
         centered: z.boolean().optional(),
         draw_blocks: z.boolean().optional(),
+        auto_resize_page: z.boolean().optional(),
     }).optional(),
     added_net: z.array(z.object({
         designator: z.string(),
@@ -136,14 +136,14 @@ const ExplainPinSchema = () => z.object({
     pin_number: z.union([z.number(), z.string()]).describe('Pin number.'),
     name: z.string().describe('Pin name (e.g., "VCC").'),
     signal_name: z.string().describe('The name of the signal the pin is connected to. (Name only). The signal name assigned to the pin must be identical to the signal name of the target output.'),
+    port_style: z.enum(['in', 'out', 'bi']).optional().describe('Detected style of a net port physically connected to this pin.'),
 });
 
 export const ExplainComponentSchema = () => z.object({
     designator: z.string().describe('Component identifier (e.g., "U1", "R5", "J1", "X1").'),
     value: z.string().describe('Minimum description: for simple components — only the nominal value; for microcircuits — only the name. Only ASCII symbols (e.g., "LM358", "10nF", "100k").'),
     pins: z.array(ExplainPinSchema()).describe('Pin details.'),
-    part_uuid: LibraryDeviceId().nullable().describe('Unique component identifier.'),
-    library_uuid: z.string().min(1).optional(),
+    part_uuid: PartUuidStruct().nullable().describe('Resolved EasyEDA device reference.'),
     pos: z.object({
         x: z.number(),
         y: z.number(),
@@ -160,19 +160,19 @@ export const ExplainCircuitStruct = () => z.object({
 
 export const CircuitModStruct = () => z.object({
     add_components: (z.array(BaseComponentSchema().omit({ part_uuid: true }).extend({
-        part_uuid: LibraryDeviceId().describe('Device ID returned by component_search')
-    })).describe('Components to add')),
-    add_reused_blocks: (z.array(CircuitReusedBlockSchema()).describe('reuded blocks to add')),
-    rm_components: ((z.array(z.string().describe('component designator')).nullable().describe('Components to remove from the circuit'))),
+        part_uuid: PartUuidStruct().describe("Resolved EasyEDA device reference")
+    })).describe('Components to add').default([])),
+    add_reused_blocks: (z.array(CircuitReusedBlockSchema()).describe('reused blocks to add').default([])),
+    rm_components: ((z.array(z.string().describe('component designator')).nullable().describe('Components to remove from the circuit').default(null))),
     external_rm_connect: ((z.array(z.object({
         designator: z.string().describe('Target component designator'),
         pin_number: z.union([z.number(), z.string()]).describe('Target component pin number'),
-    })).nullable())).describe('Use only if you need to remove/break the connection from an external component\'s pin. Remember to remove external_rm_connect first and then add external_connect.'),
+    })).nullable().default(null))).describe('Use only if you need to remove/break the connection from an external component\'s pin. Remember to remove external_rm_connect first and then add external_connect.'),
     external_connect: ((z.array(z.object({
         designator: z.string().describe('Target component designator'),
         pin_number: z.union([z.number(), z.string()]).describe('Target component pin number'),
         signal_name: z.string().describe('Signal name'),
-    })).nullable())).describe('Use only when you need to connect to a pin of an external component that you have not modified and that does not have a signal_name')
+    })).nullable().default(null))).describe('Use only when you need to connect to a pin of an external component that you have not modified and that does not have a signal_name')
 });
 
 export type CircuitMod = z.infer<ReturnType<typeof CircuitModStruct>>;

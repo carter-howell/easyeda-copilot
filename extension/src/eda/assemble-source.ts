@@ -1,11 +1,12 @@
-import { getNetFlagKind, getSpecialSignalName, getComponentTemplateKey } from "./assembly-symbols";
+import { getNetFlagKind, getSpecialSignalName, getComponentTemplateKey, getNetPortStyle } from "./assembly-symbols";
 import { CircuitAssembly } from "@copilot/shared/types/circuit";
 import PQueue from "p-queue";
 import { searchFreePlaceV2 } from "./free-place-searcher";
 import { getLibraryUuidList, placeComponent } from "./place-component";
 import { getAllPrimitivePins, getPrimitiveComponentPins, searchComponentInSCH } from "./search";
-import { AddedNet, ECHOSYS_LIB, NET_PORT_COMPONENT, Offset, shortSymbolsMap } from "./types";
-import { getPageSize, normalizeWireLine, normWireY, rmPartFromDesignator, to2, VERSION_EDASYEDA, yieldToEventLoop } from "./utils";
+import { AddedNet, isNetPortUuid, NET_PORT_COMPONENT, STYLED_NET_PORT_COMPONENTS, Offset, shortSymbolsMap } from "./types";
+import { getPartLibraryUuid, getPartUuid, getPartUuidKey } from '@copilot/shared/types/lcsc';
+import { getPageSize, normalizeWireLine, normWireY, rmPartFromDesignator, to2, VERSION_EDASYEDA, withTimeout, yieldToEventLoop } from "./utils";
 import { sch_PrimitiveWireSnap } from "./wire-snap";
 import {
     appendDocumentSource,
@@ -18,11 +19,17 @@ import {
     SourceRecord,
 } from "./source-document";
 import { normalizeMultipartSourceDesignators } from "./multipart-source-designator";
+import { LEGACY_PORT_LENGTHS, matchingWirePort, wirePortLabel, wirePortLengths, wirePortMinLength } from './wire-port-layout';
+import { formatUnresolvedNetPortMessage, type UnresolvedNetPortSample } from './unresolved-net-port-message';
+import { readPartUuidFromPrimitive, storePartUuidOnPrimitive } from './component-part-ref';
+import { samePartUuid } from '@copilot/shared/types/lcsc';
+import { DRAWING_LIBRARY_UUID, DRAWING_SHEETS, selectDrawingSheet } from './schematic-page-geometry';
 
 type AssemblyComponent = CircuitAssembly['components'][number];
+type NetPortStyle = NonNullable<AssemblyComponent['pins'][number]['port_style']>;
 type PrimitiveComponent = ISCH_PrimitiveComponent | ISCH_PrimitiveComponent$1;
-type LegacyAssembler = (circuit: CircuitAssembly) => Promise<void>;
-type LegacyBlockDrawer = (blocks: CircuitAssembly['blocks_rect'], offset: Offset) => Promise<void>;
+type LegacyAssembler = (circuit: CircuitAssembly, signal?: AbortSignal) => Promise<void>;
+type LegacyBlockDrawer = (blocks: CircuitAssembly['blocks_rect'], offset: Offset, signal?: AbortSignal) => Promise<void>;
 
 interface PlannedComponent {
     input: AssemblyComponent;
@@ -64,6 +71,7 @@ interface WireSpec {
     segments: WireSegment[];
     net: string;
     description: string;
+    wirePortSegment?: WireSegment;
 }
 
 type WireSegment = [number, number, number, number];
@@ -121,7 +129,7 @@ const getComponentLayoutPosition = (component: AssemblyComponent) => ({
 });
 
 const usesNativeNetPort = (component: AssemblyComponent) =>
-    component.part_uuid === NET_PORT_COMPONENT.uuid &&
+    Boolean(component.part_uuid && isNetPortUuid(getPartUuid(component.part_uuid))) &&
     !eda.sys_Environment.isOnlineMode();
 
 // After done(), BI needs +90 degrees to match the library port's pin orientation.
@@ -147,14 +155,17 @@ async function resolveMultipartSubPartNames(plans: PlannedComponent[]): Promise<
     const byPartUuid = new Map<string, PlannedComponent[]>();
     for (const plan of unresolved) {
         const partUuid = plan.input.part_uuid;
-        if (!partUuid || partUuid === 'GND' || partUuid === 'VCC') continue;
-        const group = byPartUuid.get(partUuid) ?? [];
+        if (!partUuid || getPartUuid(partUuid) === 'GND' || getPartUuid(partUuid) === 'VCC') continue;
+        const partKey = getPartUuidKey(partUuid);
+        const group = byPartUuid.get(partKey) ?? [];
         group.push(plan);
-        byPartUuid.set(partUuid, group);
+        byPartUuid.set(partKey, group);
     }
 
-    const libraryUuids = await getLibraryUuidList('lcsc');
-    for (const [partUuid, partPlans] of byPartUuid) {
+    for (const [partKey, partPlans] of byPartUuid) {
+        const partRef = partPlans[0].input.part_uuid!;
+        const partUuid = getPartUuid(partRef);
+        const libraryUuids = await getLibraryUuidList(getPartLibraryUuid(partRef));
         let subPartNames: string[] = [];
         for (const libraryUuid of libraryUuids) {
             const device = await eda.lib_Device.get(partUuid, libraryUuid).catch(() => undefined);
@@ -170,7 +181,7 @@ async function resolveMultipartSubPartNames(plans: PlannedComponent[]): Promise<
             const subPartName = subPartNames[index - 1];
             if (!subPartName) {
                 throw new Error(
-                    `Cannot resolve multi-part ${plan.input.designator} for ${partUuid}; ` +
+                    `Cannot resolve multi-part ${plan.input.designator} for ${partKey}; ` +
                     `library returned ${subPartNames.length} sub-parts`,
                 );
             }
@@ -184,10 +195,29 @@ async function resolveMultipartSubPartNames(plans: PlannedComponent[]): Promise<
     }
 }
 
+async function createNativeNetPort(
+    component: AssemblyComponent, plan: PlannedComponent, style: NetPortStyle, rotation: number, mirror: boolean,
+): Promise<PrimitiveComponent | undefined> {
+    const requested = style.toUpperCase() as 'IN' | 'OUT' | 'BI';
+    const directions: Array<'IN' | 'OUT' | 'BI'> = requested === 'BI' ? ['BI'] : [requested, 'BI'];
+    for (const direction of directions) {
+        try {
+            const primitive = await eda.sch_PrimitiveComponent.createNetPort(
+                direction, getSpecialSignalName(component), to2(plan.apiX), to2(plan.apiY), rotation, mirror,
+            );
+            if (primitive) return primitive;
+        } catch (error) {
+            eda.sys_Log.add(`[source-assemble] Native ${direction} port failed for ${component.designator}: ${String(error)}`, ESYS_LogType.WARNING);
+        }
+    }
+    return undefined;
+}
+
 async function createSeedComponent(plan: PlannedComponent): Promise<PrimitiveComponent> {
     const component = plan.input;
     const partUuid = component.part_uuid;
     if (!partUuid) throw new Error(`Missing part_uuid for ${component.designator}`);
+    const rawPartUuid = getPartUuid(partUuid);
 
     const rotation = getComponentRotation(component);
     const mirror = component.pos.mirror ?? false;
@@ -199,25 +229,31 @@ async function createSeedComponent(plan: PlannedComponent): Promise<PrimitiveCom
             netFlagKind, getSpecialSignalName(component), to2(plan.apiX), to2(plan.apiY), rotation, mirror,
         );
     } else if (usesNativeNetPort(component)) {
-        primitive = await eda.sch_PrimitiveComponent.createNetPort(
-            'BI', getSpecialSignalName(component), to2(plan.apiX), to2(plan.apiY), rotation, mirror,
-        );
+        primitive = await createNativeNetPort(component, plan, getNetPortStyle(component) ?? 'bi', rotation, mirror);
     } else if (component.value === 'unknown_shortsym') {
-        primitive = await placeComponent({ libraryUuid: 'lcsc', uuid: partUuid }, {
+        primitive = await placeComponent({ libraryUuid: 'lcsc', uuid: rawPartUuid }, {
             x: plan.apiX,
             y: plan.apiY,
             rotate: rotation,
             mirror,
         });
+    } else if (component.designator.includes('|') && isNetPortUuid(rawPartUuid)) {
+        const style = getNetPortStyle(component) ?? 'bi';
+        try {
+            primitive = await eda.sch_PrimitiveComponent.create(
+                STYLED_NET_PORT_COMPONENTS[style],
+                to2(plan.apiX), to2(plan.apiY), undefined, rotation, mirror,
+            );
+        } catch (error) {
+            eda.sys_Log.add(`[source-assemble] Library port failed for ${component.designator}: ${String(error)}`, ESYS_LogType.WARNING);
+        }
+        primitive ??= await createNativeNetPort(component, plan, style, normalizeRotation(rotation + 90), mirror);
     } else if (component.designator.includes('|')) {
-        primitive = await placeComponent({ libraryUuid: ECHOSYS_LIB, uuid: partUuid }, {
-            x: plan.apiX,
-            y: plan.apiY,
-            rotate: rotation,
-            mirror,
+        primitive = await placeComponent({ libraryUuid: getPartLibraryUuid(partUuid), uuid: rawPartUuid }, {
+            x: plan.apiX, y: plan.apiY, rotate: rotation, mirror,
         });
     } else {
-        primitive = await placeComponent({ libraryUuid: 'lcsc', uuid: partUuid }, {
+        primitive = await placeComponent({ libraryUuid: getPartLibraryUuid(partUuid), uuid: rawPartUuid }, {
             x: plan.apiX,
             y: plan.apiY,
             rotate: rotation,
@@ -225,9 +261,10 @@ async function createSeedComponent(plan: PlannedComponent): Promise<PrimitiveCom
             subPartName: component.sub_part_name,
         });
         primitive = primitive.setState_Designator(rmPartFromDesignator(component.designator));
+        storePartUuidOnPrimitive(primitive, partUuid);
     }
 
-    if (!primitive) throw new Error(`Component creation failed for ${component.designator}: ${partUuid}`);
+    if (!primitive) throw new Error(`Component creation failed for ${component.designator}: ${JSON.stringify(partUuid)}`);
 
     if (isNamedNetSymbol(component)) {
         const signalName = getSpecialSignalName(component);
@@ -280,7 +317,8 @@ async function cacheTemplatesFromCurrentPage(
 ): Promise<number> {
     const missing = [...groups.entries()].filter(([key, group]) =>
         !componentTemplateCache.has(getTemplateCacheKey(projectUuid, key)) &&
-        getNetFlagKind(group[0].input) === undefined,
+        getNetFlagKind(group[0].input) === undefined &&
+        !getNetPortStyle(group[0].input),
     );
     if (!missing.length) return 0;
 
@@ -292,10 +330,8 @@ async function cacheTemplatesFromCurrentPage(
         const subPartName = primitive.getState_SubPartName?.() ?? '';
         const candidate = missing.find(([key, group]) =>
             !componentTemplateCache.has(getTemplateCacheKey(projectUuid, key)) &&
-            (
-                (Boolean(group[0].input.sub_part_name) && group[0].input.sub_part_name === subPartName) ||
-                (group[0].input.part_uuid === componentState.uuid && !group[0].input.sub_part_name)
-            ),
+            samePartUuid(group[0].input.part_uuid, readPartUuidFromPrimitive(primitive)) &&
+            (!group[0].input.sub_part_name || group[0].input.sub_part_name === subPartName),
         );
         if (!candidate) continue;
 
@@ -496,7 +532,9 @@ function cloneComponentsIntoSource(
 
         const sourceSeedX = Number(template.component.inner.x);
         const sourceSeedY = Number(template.component.inner.y);
-        const yFactor = Math.abs(sourceSeedY - template.originApiY) <= Math.abs(sourceSeedY + template.originApiY) ? 1 : -1;
+        // At Y=0 both conventions match. V3 source Y is opposite to API Y;
+        // prefer that convention on a tie instead of reflecting cached clones.
+        const yFactor = Math.abs(sourceSeedY - template.originApiY) < Math.abs(sourceSeedY + template.originApiY) ? 1 : -1;
         const seedRotation = Number(template.component.inner.rotation) || 0;
         const seedMirror = Boolean(template.component.inner.isMirror);
         const plansToClone = template.firstPlanSeeded ? group.slice(1) : group;
@@ -847,10 +885,16 @@ function connectedSegmentGroups(segments: WireSegment[]): WireSegment[][] {
 
 function normalizeWireSpecs(specs: WireSpec[]): WireSpec[] {
     const byNet = new Map<string, WireSegment[]>();
+    const portSegments = new Map<string, WireSegment[]>();
     for (const spec of specs) {
         const segments = byNet.get(spec.net) ?? [];
         segments.push(...spec.segments);
         byNet.set(spec.net, segments);
+        if (spec.wirePortSegment) {
+            const ports = portSegments.get(spec.net) ?? [];
+            ports.push(spec.wirePortSegment);
+            portSegments.set(spec.net, ports);
+        }
     }
 
     const normalized: WireSpec[] = [];
@@ -861,6 +905,7 @@ function normalizeWireSpecs(specs: WireSpec[]): WireSpec[] {
                 net,
                 segments: connected,
                 description: `${net} normalized group ${index + 1}`,
+                wirePortSegment: matchingWirePort(connected, portSegments.get(net) ?? []),
             });
         }
     }
@@ -984,6 +1029,13 @@ async function bulkAddWires(specs: WireSpec[]): Promise<number> {
             attribute.inner.parentId = wireId;
             if (attribute.inner.key === 'NET') {
                 normalizeWireNetAttribute(attribute.inner, spec.net, sourceLastSegment);
+                if (spec.wirePortSegment) {
+                    try {
+                        const [x1, y1, x2, y2] = spec.wirePortSegment;
+                        const label = wirePortLabel(spec.net, [x1, y1 * yFactor, x2, y2 * yFactor]);
+                        if (label) Object.assign(attribute.inner, label);
+                    } catch { /* Retain the ordinary wire label if cosmetic placement fails. */ }
+                }
             }
             appended.push(attribute);
         }
@@ -1038,6 +1090,7 @@ function getUnusedPinNets(circuit: CircuitAssembly, plans: PlannedComponent[]) {
 interface ResolvedNetPin {
     pin: ISCH_PrimitiveComponentPin;
     pins: ISCH_PrimitiveComponentPin[];
+    componentId?: string;
 }
 
 interface OccupiedWireSegment {
@@ -1056,7 +1109,7 @@ async function resolveNetPin(net: AddedNet, plans: PlannedComponent[]): Promise<
     if (plan?.pins?.length) {
         const pin = plan.pins.find(item => item.getState_PinNumber() == net.pin_number) ??
             plan.pins.find(item => net.pin_name && item.getState_PinName() === net.pin_name);
-        if (pin) return { pin, pins: plan.pins };
+        if (pin) return { pin, pins: plan.pins, componentId: plan.primitiveId };
     }
 
     const components = await searchComponentInSCH(net.designator).catch(() => undefined);
@@ -1064,7 +1117,7 @@ async function resolveNetPin(net: AddedNet, plans: PlannedComponent[]): Promise<
         const pins = await getPrimitiveComponentPins(component.primitiveId).catch(() => []);
         const pin = pins.find(item => item.getState_PinNumber() == net.pin_number) ??
             pins.find(item => net.pin_name && item.getState_PinName() === net.pin_name);
-        if (pin) return { pin, pins };
+        if (pin) return { pin, pins, componentId: component.primitiveId };
     }
     return undefined;
 }
@@ -1124,6 +1177,13 @@ function createSourceWorkingCircuit(circuit: CircuitAssembly): CircuitAssembly {
         return (incoming && replacements.has(rmPartFromDesignator(incoming.designator))) ||
             (outgoing && replacements.has(rmPartFromDesignator(outgoing.designator)));
     }));
+    const referenced = new Set(working.edges.flatMap(edge => (edge.sections ?? []).flatMap(section => [
+        splitPinShape(section.incomingShape)?.designator,
+        splitPinShape(section.outgoingShape)?.designator,
+    ])));
+    working.components = working.components.filter(component =>
+        !component.designator.includes('|') || referenced.has(component.designator),
+    );
     return working;
 }
 
@@ -1318,7 +1378,7 @@ function applySourceReplacements(source: string, plans: PlannedComponent[]): str
         );
         if (!component?.inner) throw new Error(`New replacement source missing for ${plan.input.designator}`);
         const sourceY = Number(component.inner.y);
-        const yFactor: 1 | -1 = Math.abs(sourceY - plan.apiY) <= Math.abs(sourceY + plan.apiY) ? 1 : -1;
+        const yFactor: 1 | -1 = Math.abs(sourceY - plan.apiY) < Math.abs(sourceY + plan.apiY) ? 1 : -1;
         component.inner.x = to2(Number(component.inner.x) + replacement.shiftX);
         component.inner.y = to2(sourceY + replacement.shiftY * yFactor);
         for (const record of records) {
@@ -1342,8 +1402,9 @@ async function bulkAddNetAttachments(
     plans: PlannedComponent[],
     projectUuid: string,
     circuitWireSpecs: WireSpec[],
-): Promise<{ wireSpecs: WireSpec[]; portCount: number; unresolved: number; apiSeeds: number }> {
-    if (!nets.length) return { wireSpecs: [], portCount: 0, unresolved: 0, apiSeeds: 0 };
+    preferReadableLengths = true,
+): Promise<{ wireSpecs: WireSpec[]; portCount: number; unresolved: number; unresolvedSamples: UnresolvedNetPortSample[]; apiSeeds: number; portPlans: PlannedComponent[] }> {
+    if (!nets.length) return { wireSpecs: [], portCount: 0, unresolved: 0, unresolvedSamples: [], apiSeeds: 0, portPlans: [] };
     const occupied = await getOccupiedWireSegments(circuitWireSpecs);
     const portPlans: PlannedComponent[] = [];
     const portWires: WireSpec[] = [];
@@ -1353,11 +1414,30 @@ async function bulkAddNetAttachments(
         netCountByDesignator.set(net.designator, (netCountByDesignator.get(net.designator) ?? 0) + 1);
     }
     let unresolved = 0;
+    let routeFailed = false;
+    const unresolvedSamples: UnresolvedNetPortSample[] = [];
+    const recordUnresolved = (net: AddedNet, reason: UnresolvedNetPortSample['reason']) => {
+        unresolved++;
+        if (unresolvedSamples.length < 3) unresolvedSamples.push({ net, reason });
+    };
 
+    const resolvedNets: Array<{ net: AddedNet; resolved: ResolvedNetPin | undefined; group?: string }> = [];
+    const preferredLengths = new Map<string, number>();
     for (const net of nets) {
         const resolved = await resolveNetPin(net, plans);
+        let group: string | undefined;
+        if (resolved) {
+            try {
+                group = `${resolved.componentId ?? net.designator}:${normalizeRotation(resolved.pin.getState_Rotation())}`;
+                preferredLengths.set(group, Math.max(preferredLengths.get(group) ?? 0, wirePortMinLength(net.net)));
+            } catch { /* Cosmetic sizing must not prevent the legacy placement fallback. */ }
+        }
+        resolvedNets.push({ net, resolved, group });
+    }
+
+    for (const { net, resolved, group } of resolvedNets) {
         if (!resolved) {
-            unresolved++;
+            recordUnresolved(net, 'pin not found');
             eda.sys_Log.add(
                 `[source-assemble] added_net pin not found: ${net.designator} ${net.pin_number}`,
                 ESYS_LogType.WARNING,
@@ -1375,11 +1455,14 @@ async function bulkAddNetAttachments(
             continue;
         }
         if (occupied.some(item => item.net !== net.net && pointOnWireSegment(pinX, pinY, item.segment))) {
-            unresolved++;
-            eda.sys_Log.add(
-                `[source-assemble] added_net conflict at ${net.designator}.${net.pin_number}: ${net.net}`,
-                ESYS_LogType.WARNING,
-            );
+            routeFailed = true;
+            recordUnresolved(net, 'wire conflict');
+            if (!preferReadableLengths) {
+                eda.sys_Log.add(
+                    `[source-assemble] added_net conflict at ${net.designator}.${net.pin_number}: ${net.net}`,
+                    ESYS_LogType.WARNING,
+                );
+            }
             continue;
         }
 
@@ -1398,7 +1481,10 @@ async function bulkAddNetAttachments(
             : [primaryDirection, ...[0, 1, 2, 3].filter(index =>
                 index !== primaryDirection && index !== forbiddenDirection,
             )];
-        const lengths = [20, 30, ...Array.from({ length: 39 }, (_, index) => 40 + index * 20), 15, 10, 5];
+        let bareLengths = LEGACY_PORT_LENGTHS;
+        try {
+            if (preferReadableLengths) bareLengths = wirePortLengths(net.net, group ? preferredLengths.get(group) : undefined);
+        } catch { /* Keep every legacy length, including 15, 10 and 5. */ }
         const portOffsetLengths = Array.from({ length: 80 }, (_, index) => (index + 1) * 10);
         let selected: {
             segments: WireSegment[];
@@ -1412,6 +1498,7 @@ async function bulkAddNetAttachments(
         for (const directionIndex of directionOrder) {
             const direction = directions[directionIndex];
             for (const makePort of requestedPort ? [true, false] : [false]) {
+                const lengths = makePort ? LEGACY_PORT_LENGTHS : bareLengths;
                 for (const length of lengths) {
                     const middleX = pinX + direction.dx * length;
                     const middleY = pinY + direction.dy * length;
@@ -1449,11 +1536,14 @@ async function bulkAddNetAttachments(
         }
 
         if (!selected) {
-            unresolved++;
-            eda.sys_Log.add(
-                `[source-assemble] No free bulk net-port route: ${net.net} at ${net.designator}.${net.pin_number}`,
-                ESYS_LogType.WARNING,
-            );
+            routeFailed = true;
+            recordUnresolved(net, 'no free route');
+            if (!preferReadableLengths) {
+                eda.sys_Log.add(
+                    `[source-assemble] No free bulk net-port route: ${net.net} at ${net.designator}.${net.pin_number}`,
+                    ESYS_LogType.WARNING,
+                );
+            }
             continue;
         }
 
@@ -1488,16 +1578,21 @@ async function bulkAddNetAttachments(
                 templateKey: getComponentTemplateKey(input),
             });
         }
-        const wireSpec = {
+        const wireSpec: WireSpec = {
             segments: selected.segments,
             net: net.net,
             description: `bulk port ${net.designator}.${net.pin_number}`,
+            wirePortSegment: !selected.makePort ? selected.segments[0] : undefined,
         };
         portWires.push(wireSpec);
         occupied.push(...selected.canonicalSegments.map(segment => ({ net: net.net, segment })));
     }
 
-    if (!portPlans.length) return { wireSpecs: portWires, portCount: 0, unresolved, apiSeeds: 0 };
+    // Planning above has no writes. A longer stub must not prevent a neighbour's old route.
+    if (preferReadableLengths && routeFailed) {
+        return bulkAddNetAttachments(nets, plans, projectUuid, circuitWireSpecs, false);
+    }
+    if (!portPlans.length) return { wireSpecs: portWires, portCount: 0, unresolved, unresolvedSamples, apiSeeds: 0, portPlans };
     const groups = groupPlans(portPlans);
     let source = await eda.sys_FileManager.getDocumentSource();
     if (!source) throw new Error('Document source is empty before bulk net ports');
@@ -1515,7 +1610,9 @@ async function bulkAddNetAttachments(
         wireSpecs: portWires,
         portCount: portPlans.length,
         unresolved,
+        unresolvedSamples,
         apiSeeds: seededKeys.size,
+        portPlans,
     };
 }
 
@@ -1841,6 +1938,8 @@ async function resolveDetachedNets(points: SourceRemovalResult['detachedNets']):
     const primitives = await eda.sch_PrimitiveComponent.getAll().catch(() => []);
     const result: AddedNet[] = [];
     for (const primitive of primitives) {
+        // Orphaned flags/ports must be cleaned up, not connected to another flag/port.
+        if (primitive.getState_ComponentType() !== ESCH_PrimitiveComponentType.COMPONENT) continue;
         const designator = primitive.getState_Designator?.();
         if (!designator) continue;
         const pins = await getPrimitiveComponentPins(primitive.getState_PrimitiveId()).catch(() => []);
@@ -1875,6 +1974,68 @@ async function setSourceAndRefresh(source: string, label: string): Promise<void>
     const applied = await eda.sys_FileManager.setDocumentSource(source);
     if (!applied) throw new Error(`EasyEDA rejected ${label} document source`);
     await refreshSchematicIndexes();
+}
+
+async function finalizeSourceComponents(plans: PlannedComponent[], signal?: AbortSignal): Promise<void> {
+    const named = new Map<string, string>();
+    const ids = new Set<string>();
+    for (const plan of plans) {
+        if (!plan.primitiveId) continue;
+        ids.add(plan.primitiveId);
+        if (isNamedNetSymbol(plan.input)) named.set(plan.primitiveId, getSpecialSignalName(plan.input));
+    }
+
+    let completed = 0;
+    let failed = 0;
+    for (const id of ids) {
+        signal?.throwIfAborted();
+        try {
+            const primitive = await withTimeout(
+                eda.sch_PrimitiveComponent.get(id), 10_000, `Timed out reading component ${id}`, signal,
+            );
+            if (!primitive) continue; // An unused short symbol may have been removed.
+
+            const editable = primitive.toAsync();
+            const net = named.get(id);
+            if (net) {
+                editable.setState_Name(net);
+                editable.setState_Net(net);
+                editable.setState_OtherProperty({
+                    ...editable.getState_OtherProperty(),
+                    'Global Net Name': net,
+                });
+            }
+            await withTimeout(editable.done(), 10_000, `Timed out finalizing component ${id}`, signal);
+            completed++;
+        } catch (error) {
+            signal?.throwIfAborted();
+            failed++;
+            eda.sys_Log.add(`[source-assemble] Component finalization failed for ${id}: ${String(error)}`, ESYS_LogType.WARNING);
+        }
+    }
+
+    if (named.size) {
+        try {
+            const source = await eda.sys_FileManager.getDocumentSource();
+            if (source) {
+                const records = parseDocumentSource(source);
+                let restored = 0;
+                for (const record of records) {
+                    if (record.outer.type !== 'ATTR' || !record.inner) continue;
+                    if (record.inner.key !== 'Name' && record.inner.key !== 'Global Net Name') continue;
+                    const net = named.get(String(record.inner.parentId ?? ''));
+                    if (!net || record.inner.value === net) continue;
+                    record.inner.value = net;
+                    restored++;
+                }
+                if (restored) await setSourceAndRefresh(serializeDocumentSource(records), 'net name preservation');
+            }
+        } catch (error) {
+            signal?.throwIfAborted();
+            eda.sys_Log.add(`[source-assemble] Net name preservation failed: ${String(error)}`, ESYS_LogType.WARNING);
+        }
+    }
+    eda.sys_Log.add(`[source-assemble] Finalized ${completed} components; ${failed} failed`);
 }
 
 async function removeUnusedShortSymbols(): Promise<number> {
@@ -1931,7 +2092,8 @@ function requiresLegacyAssembler(circuit: CircuitAssembly): string | undefined {
     return undefined;
 }
 
-async function getAssemblyOffset(circuit: CircuitAssembly): Promise<Offset> {
+async function getAssemblyOffset(circuit: CircuitAssembly, signal?: AbortSignal): Promise<Offset> {
+    signal?.throwIfAborted();
     let root = circuit.blocks_rect?.find(block => block.name.includes('__v_root__'));
     if (!root) {
         eda.sys_Log.add(
@@ -1940,13 +2102,85 @@ async function getAssemblyOffset(circuit: CircuitAssembly): Promise<Offset> {
         );
         root = { name: '__v_root__', description: '', x: 0, y: 0, width: 10, height: 10 };
     }
-    const pageSize = await getPageSize();
-    const target = {
+    let pageSize = await getPageSize();
+    signal?.throwIfAborted();
+    let target = {
         x: (pageSize.width - root.width) / 2,
         y: ((pageSize.height - root.height) / 2) + root.height,
     };
+    if (circuit.assembly_options?.auto_resize_page) {
+        const page = await eda.dmt_Schematic.getCurrentSchematicPageInfo().catch(() => undefined);
+        signal?.throwIfAborted();
+        const currentDrawing = DRAWING_SHEETS.find(sheet =>
+            page?.titleBlockData?.Symbol?.value === `Drawing-Symbol_${sheet.name}` &&
+            pageSize.width === sheet.width && pageSize.height === sheet.height &&
+            (page?.showTitleBlock === false || String(page?.titleBlockData?.['Title Block Position']?.value) === '3'),
+        );
+        const selection = currentDrawing ? selectDrawingSheet({
+            ...pageSize,
+            showTitleBlock: page?.showTitleBlock,
+        }, root.width, root.height) : undefined;
+        if (selection) {
+            let usePlacement = true;
+            if (selection.resized) {
+                const drawing = await eda.lib_Device.get(selection.sheet.deviceUuid, DRAWING_LIBRARY_UUID)
+                    .catch(() => undefined);
+                signal?.throwIfAborted();
+                if (!drawing) {
+                    usePlacement = false;
+                    eda.sys_Log.add(`[source-assemble] Drawing symbol ${selection.sheet.name} is unavailable; keeping current page size`, ESYS_LogType.WARNING);
+                } else {
+                    // Drawing creation can refresh its editor context before the API promise resolves.
+                    // Observe the resulting sheet instead of waiting indefinitely for that promise.
+                    let createError: unknown;
+                    let createFailed = false;
+                    void Promise.resolve().then(() => {
+                        signal?.throwIfAborted();
+                        return eda.sch_PrimitiveComponent.create(drawing, 0, 0);
+                    }).catch(error => { createError = error; createFailed = true; });
+                    let updated = false;
+                    for (let attempt = 0; attempt < 100; attempt++) {
+                        signal?.throwIfAborted();
+                        await yieldToEventLoop();
+                        signal?.throwIfAborted();
+                        const current = await eda.dmt_Schematic.getCurrentSchematicPageInfo().catch(() => undefined);
+                        signal?.throwIfAborted();
+                        pageSize = await getPageSize();
+                        signal?.throwIfAborted();
+                        updated = pageSize.width === selection.sheet.width &&
+                            pageSize.height === selection.sheet.height &&
+                            current?.titleBlockData?.Symbol?.value === `Drawing-Symbol_${selection.sheet.name}`;
+                        if (updated) break;
+                        if (createFailed) break;
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                    if (!updated) {
+                        if (!createFailed) {
+                            throw new Error(`Drawing symbol ${selection.sheet.name} did not resize the page`);
+                        }
+                        usePlacement = false;
+                        // A completed failure may still have changed the page partially.
+                        // Place for the last observed size, not the requested one.
+                        target = {
+                            x: (pageSize.width - root.width) / 2,
+                            y: ((pageSize.height - root.height) / 2) + root.height,
+                        };
+                        eda.sys_Log.add(`[source-assemble] Drawing symbol ${selection.sheet.name} did not resize the page; keeping the observed page size: ${String(createError)}`, ESYS_LogType.WARNING);
+                    } else {
+                        eda.sys_Log.add(`[source-assemble] Resized schematic page to ${selection.sheet.name}`);
+                    }
+                }
+            }
+            if (usePlacement) target = { x: selection.placement.x, y: selection.placement.y + root.height };
+        } else if (!currentDrawing) {
+            eda.sys_Log.add('[source-assemble] Custom or inconsistent drawing symbol; keeping current page size', ESYS_LogType.WARNING);
+        } else {
+            eda.sys_Log.add('[source-assemble] No standard drawing sheet fits the layout; keeping current page size', ESYS_LogType.WARNING);
+        }
+    }
     if (target.x === 0) target.x = 10;
     if (target.y === 0) target.y = 10;
+    signal?.throwIfAborted();
     return searchFreePlaceV2(target, { w: root.width, h: root.height });
 }
 
@@ -1954,46 +2188,56 @@ export async function assembleCircuitSourceTask(
     circuit: CircuitAssembly,
     legacyAssembler: LegacyAssembler,
     legacyBlockDrawer: LegacyBlockDrawer,
+    signal?: AbortSignal,
 ): Promise<void> {
+    const step = async <T>(action: () => Promise<T>) => {
+        signal?.throwIfAborted();
+        const result = await action();
+        signal?.throwIfAborted();
+        return result;
+    };
     const fallbackReason = requiresLegacyAssembler(circuit);
     if (fallbackReason) {
         eda.sys_Log.add(`[source-assemble] Legacy fallback: ${fallbackReason}`, ESYS_LogType.INFO);
-        return legacyAssembler(circuit);
+        return legacyAssembler(circuit, signal);
     }
 
     const startedAt = Date.now();
     eda.sys_Message.showToastMessage('Assemble circuit from source...', ESYS_ToastMessageType.INFO);
     eda.sys_Log.add('[source-assemble] Start', ESYS_LogType.INFO);
-    const checkpointCreated = Boolean(await eda.checkpointer?.save(true));
+    if (!eda.checkpointer) throw new Error('Checkpointer is unavailable');
+    const checkpointCreated = Boolean(await step(() => eda.checkpointer!.save(true)));
+    if (!checkpointCreated) throw new Error('Failed to create schematic assembly checkpoint');
     let detachedNets: AddedNet[] = [];
 
     try {
         const workingCircuit = createSourceWorkingCircuit(circuit);
-        const currentDocument = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+        const currentDocument = await step(() => eda.dmt_SelectControl.getCurrentDocumentInfo());
         if (!currentDocument) throw new Error('Current schematic document info not found');
         const projectUuid = currentDocument.parentProjectUuid ?? currentDocument.uuid;
 
         const removalPlan = await buildSourceRemovalPlan(workingCircuit);
         if (removalPlan.componentIds.size || removalPlan.points.length) {
-            const currentSource = await eda.sys_FileManager.getDocumentSource();
+            const currentSource = await step(() => eda.sys_FileManager.getDocumentSource());
             if (!currentSource) throw new Error('Document source is empty before source removals');
             const removalResult = removeSourceObjects(currentSource, removalPlan);
             if (removalResult.removedRecords) {
-                await setSourceAndRefresh(removalResult.source, 'rm_components/rm_net');
-                detachedNets = await resolveDetachedNets(removalResult.detachedNets);
+                await step(() => setSourceAndRefresh(removalResult.source, 'rm_components/rm_net'));
+                detachedNets = await step(() => resolveDetachedNets(removalResult.detachedNets));
                 eda.sys_Log.add(`[source-assemble] Removed ${removalResult.removedRecords} source records`);
             }
         }
 
-        const offset = await getAssemblyOffset(workingCircuit);
+        const offset = await step(() => getAssemblyOffset(workingCircuit, signal));
         const plans = planComponents(workingCircuit, offset);
-        await resolveMultipartSubPartNames(plans);
-        let source = await eda.sys_FileManager.getDocumentSource();
+        await step(() => resolveMultipartSubPartNames(plans));
+        let source = await step(() => eda.sys_FileManager.getDocumentSource());
         if (!source) throw new Error('Document source is empty before component placement');
-        await bindReplacementPlans(workingCircuit, plans, source);
+        const initialSource = source;
+        await step(() => bindReplacementPlans(workingCircuit, plans, initialSource));
         const groups = groupPlans(plans);
         let records = parseDocumentSource(source);
-        const pageCachedVariants = await cacheTemplatesFromCurrentPage(groups, projectUuid, records);
+        const pageCachedVariants = await step(() => cacheTemplatesFromCurrentPage(groups, projectUuid, records));
         const cachedVariants = [...groups.keys()].filter(key =>
             componentTemplateCache.has(getTemplateCacheKey(projectUuid, key)),
         ).length;
@@ -2003,9 +2247,9 @@ export async function assembleCircuitSourceTask(
         );
 
         eda.sys_Log.add('[source-assemble] Stage: component seeds', ESYS_LogType.INFO);
-        const seededKeys = await placeSeeds(groups, projectUuid);
+        const seededKeys = await step(() => placeSeeds(groups, projectUuid));
 
-        source = await eda.sys_FileManager.getDocumentSource();
+        source = await step(() => eda.sys_FileManager.getDocumentSource());
         if (!source) throw new Error('Document source is empty after component seed placement');
         records = parseDocumentSource(source);
         const templates = collectComponentTemplates(records, groups, projectUuid, seededKeys);
@@ -2022,7 +2266,8 @@ export async function assembleCircuitSourceTask(
 
         if (componentResult.addedCount || multipartDesignators.changedAttributes) {
             source = serializeDocumentSource(records);
-            await setSourceAndRefresh(source, 'bulk component/multi-part designator');
+            const updatedSource = source;
+            await step(() => setSourceAndRefresh(updatedSource, 'bulk component/multi-part designator'));
             records = parseDocumentSource(source);
         }
         if (multipartDesignators.normalizedComponents) {
@@ -2033,18 +2278,18 @@ export async function assembleCircuitSourceTask(
         }
 
         eda.sys_Log.add('[source-assemble] Stage: load pins', ESYS_LogType.INFO);
-        await loadPins(plans);
+        await step(() => loadPins(plans));
         const replacementOccupied = plans.some(plan => plan.replacement)
             ? await getOccupiedWireSegments([])
             : [];
         const replacementBridges = validateSourceReplacements(plans, replacementOccupied);
         if (plans.some(plan => plan.replacement)) {
-            source = await eda.sys_FileManager.getDocumentSource();
+            source = await step(() => eda.sys_FileManager.getDocumentSource());
             if (!source) throw new Error('Document source is empty before source replacements');
             const replacedSource = applySourceReplacements(source, plans);
-            await setSourceAndRefresh(replacedSource, 'replace_components');
+            await step(() => setSourceAndRefresh(replacedSource, 'replace_components'));
             for (const plan of plans) plan.pins = undefined;
-            await loadPins(plans);
+            await step(() => loadPins(plans));
             eda.sys_Log.add(
                 `[source-assemble] Replaced ${plans.filter(plan => plan.replacement).length} component units`,
                 ESYS_LogType.INFO,
@@ -2060,25 +2305,29 @@ export async function assembleCircuitSourceTask(
             ...replacementBridges,
         ];
         eda.sys_Log.add('[source-assemble] Stage: bulk net ports', ESYS_LogType.INFO);
-        const attachmentResult = await bulkAddNetAttachments(extraNets, plans, projectUuid, circuitWireSpecs);
+        const attachmentResult = await step(() => bulkAddNetAttachments(extraNets, plans, projectUuid, circuitWireSpecs));
         const wireSpecs = normalizeWireSpecs([...circuitWireSpecs, ...attachmentResult.wireSpecs]);
         eda.sys_Log.add('[source-assemble] Stage: bulk wires', ESYS_LogType.INFO);
-        const wireCount = await bulkAddWires(wireSpecs);
+        const wireCount = await step(() => bulkAddWires(wireSpecs));
         if (workingCircuit.assembly_options?.draw_blocks) {
             eda.sys_Log.add('[source-assemble] Stage: legacy block drawing', ESYS_LogType.INFO);
-            await legacyBlockDrawer(workingCircuit.blocks_rect, offset);
+            await step(() => legacyBlockDrawer(workingCircuit.blocks_rect, offset, signal));
         }
         eda.sys_Log.add('[source-assemble] Stage: short-symbol cleanup', ESYS_LogType.INFO);
-        const removedShortSymbols = await removeUnusedShortSymbols();
+        const removedShortSymbols = await step(() => removeUnusedShortSymbols());
+        eda.sys_Log.add('[source-assemble] Stage: component finalization', ESYS_LogType.INFO);
+        await step(() => finalizeSourceComponents([...plans, ...attachmentResult.portPlans], signal));
         if (attachmentResult.unresolved) {
-            eda.sys_Message.showToastMessage(
-                `${attachmentResult.unresolved} net ports could not be placed; see source-assemble log.`,
-                ESYS_ToastMessageType.WARNING,
-            );
+            throw new Error(formatUnresolvedNetPortMessage(attachmentResult.unresolved, attachmentResult.unresolvedSamples));
         }
 
-        const saved = await eda.sch_Document.save();
-        if (!saved) throw new Error('Failed to save source-assembled schematic');
+        try {
+            const saved = await step(() => eda.sch_Document.save());
+            if (!saved) eda.sys_Log.add('[source-assemble] Document save returned false', ESYS_LogType.WARNING);
+        } catch (error) {
+            signal?.throwIfAborted();
+            eda.sys_Log.add(`[source-assemble] Document save failed: ${String(error)}`, ESYS_LogType.WARNING);
+        }
 
         const duration = Date.now() - startedAt;
         eda.sys_Log.add(
@@ -2091,7 +2340,7 @@ export async function assembleCircuitSourceTask(
         eda.sys_Message.showToastMessage('Assemble complete.', ESYS_ToastMessageType.SUCCESS);
     } catch (error) {
         eda.sys_Log.add(`[source-assemble] Failed: ${(error as Error).message}`, ESYS_LogType.ERROR);
-        if (checkpointCreated) {
+        if (checkpointCreated && !signal?.aborted) {
             const restored = await eda.checkpointer?.restore(undefined, true).catch(() => false);
             if (!restored) eda.sys_Log.add('[source-assemble] Checkpoint rollback failed', ESYS_LogType.ERROR);
         }

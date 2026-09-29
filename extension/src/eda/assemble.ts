@@ -7,10 +7,13 @@ import { getShortSymPos, removeComponent } from "./rm-compoment-with-connections
 import { getSchematic } from "./schematic";
 import { findPin, getPrimitiveComponentPins, hasDirectWire, searchComponentInSCH } from "./search";
 import { AddedNet, ComponentToReplace, ECHOSYS_LIB, GND_PORT_COMPONENT, NET_PORT_COMPONENT, Offset, PlacedComponents, VCC_PORT_COMPONENT } from "./types";
-import { chunkArray, getPageSize, normWireY, rmPartFromDesignator, to2, VERSION_EDASYEDA, withTimeout, yieldToEventLoop } from "./utils";
+import { chunkArray, getPageSize, normWireY, rmPartFromDesignator, to2, VERSION_EDASYEDA, yieldToEventLoop } from "./utils";
 import { sch_PrimitiveWireSnap } from "./wire-snap";
 import { assembleCircuitSourceTask } from "./assemble-source";
 import PQueue from 'p-queue';
+import { runAssemblyQueueTask } from './assembly-queue';
+import { getPartLibraryUuid, getPartUuid } from '@copilot/shared/types/lcsc';
+import { storePartUuidOnPrimitive } from './component-part-ref';
 
 const assembleQueue = new PQueue({ concurrency: 1 });
 const COPILOT_BLOCK_COLOR = "#808080";
@@ -25,7 +28,8 @@ const applyOffset = (x: number, y: number, offset: Offset) => {
     return { x, y };
 }
 
-async function createComponent(component: CircuitAssembly['components'][0], offset: Offset = { x: 0, y: 0 }) {
+async function createComponent(component: CircuitAssembly['components'][0], offset: Offset = { x: 0, y: 0 }, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     let comp: ISCH_PrimitiveComponent | ISCH_PrimitiveComponent$1 | undefined;
     const { part_uuid: partUuid, designator, pos } = component;
     if (!partUuid) throw new Error("createComponent partUuid not found");
@@ -34,7 +38,8 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
     const mirror = component.pos.mirror ?? false;
     const rotate = pos.rotate;
 
-    if (partUuid === 'GND') {
+    const rawPartUuid = getPartUuid(partUuid);
+    if (rawPartUuid === 'GND') {
         comp = await placeComponent(GND_PORT_COMPONENT, { x, y, rotate });
 
         const s = component.pins[0]?.signal_name ?? 'GND';
@@ -43,7 +48,7 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
             "Global Net Name": s
         });
     }
-    else if (partUuid === 'VCC') {
+    else if (rawPartUuid === 'VCC') {
         comp = await placeComponent(VCC_PORT_COMPONENT, { x, y, rotate });
 
         const s = component.pins[0]?.signal_name ?? 'VCC';
@@ -55,7 +60,7 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
     else if (component.value === 'unknown_shortsym') {
         comp = await placeComponent({
             libraryUuid: 'lcsc',
-            uuid: partUuid
+            uuid: rawPartUuid
         }, { x, y, rotate });
 
         const s = component.pins[0]?.signal_name ?? 'Unknown';
@@ -67,7 +72,7 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
     else if (component.designator.includes('|')) {
         comp = await placeComponent({
             libraryUuid: ECHOSYS_LIB,
-            uuid: partUuid
+            uuid: rawPartUuid
         }, { x, y, rotate });
 
         const s = component.pins[0]?.signal_name ?? 'Unknown';
@@ -84,14 +89,15 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
     }
     else {
         comp = await placeComponent({
-            libraryUuid: 'lcsc',
-            uuid: partUuid
+            libraryUuid: getPartLibraryUuid(partUuid),
+            uuid: rawPartUuid
         }, { x, y, rotate, subPartName: component.sub_part_name });
 
         comp = comp.setState_Designator(rmPartFromDesignator(designator));
+        storePartUuidOnPrimitive(comp, partUuid);
     }
 
-    eda.sys_Log.add(`Place component ${designator} ${partUuid} at ${x} ${y} rot: ${pos.rotate}`);
+    eda.sys_Log.add(`Place component ${designator} ${JSON.stringify(partUuid)} at ${x} ${y} rot: ${pos.rotate}`);
 
     if (mirror) {
         comp = comp.setState_Mirror(mirror);
@@ -100,15 +106,18 @@ async function createComponent(component: CircuitAssembly['components'][0], offs
     return comp;
 }
 
-async function placeComponents(components: CircuitAssembly['components'], offset: Offset = { x: 0, y: 0 }): Promise<PlacedComponents> {
+async function placeComponents(components: CircuitAssembly['components'], offset: Offset = { x: 0, y: 0 }, signal?: AbortSignal): Promise<PlacedComponents> {
     const placementQueue = new PQueue({ concurrency: 5 });
     const placedComponents = await placementQueue.addAll(components.map(component => async () => {
+        signal?.throwIfAborted();
         const { part_uuid: partUuid, designator } = component;
         if (!partUuid) return undefined;
 
         try {
-            let placedComponent: ISCH_PrimitiveComponent | ISCH_PrimitiveComponent$1 = await createComponent(component, offset);
+            let placedComponent: ISCH_PrimitiveComponent | ISCH_PrimitiveComponent$1 = await createComponent(component, offset, signal);
+            signal?.throwIfAborted();
             placedComponent = await placedComponent.done();
+            signal?.throwIfAborted();
 
             const primitiveId = placedComponent.getState_PrimitiveId();
             const pins = await getPrimitiveComponentPins(primitiveId);
@@ -148,7 +157,7 @@ function filterUniqueCoordinatePairs(arr: number[]) {
 }
 
 async function drawEdges(edges: CircuitAssembly['edges'], components: CircuitAssembly['components'],
-    placeComponents: PlacedComponents, offset: Offset = { x: 0, y: 0 }) {
+    placeComponents: PlacedComponents, offset: Offset = { x: 0, y: 0 }, signal?: AbortSignal) {
     const pointToArr = (p: { x: number, y: number }) => {
         const { x, y } = applyOffset(p.x, p.y, offset);
         return [x, normWireY(y)];
@@ -182,6 +191,7 @@ async function drawEdges(edges: CircuitAssembly['edges'], components: CircuitAss
 
     for (const edge of edges) {
         for (const section of edge.sections ?? []) {
+            signal?.throwIfAborted();
             const [sdesignator, spin] = section?.incomingShape?.split?.("_pin_") ?? ['', ''];
             const [tdesignator, tpin] = section?.outgoingShape?.split?.("_pin_") ?? ['', ''];;
 
@@ -244,6 +254,7 @@ async function drawEdges(edges: CircuitAssembly['edges'], components: CircuitAss
 
             try {
                 const wire = await sch_PrimitiveWireSnap.create(values, netName);
+                signal?.throwIfAborted();
                 await wire?.done().catch(e => e);
             } catch (err) {
                 const msg = `Wire error: ${(err as Error).message} ${JSON.stringify(values)} ${netName} ${section.incomingShape} -> ${section.outgoingShape};\n` +
@@ -258,9 +269,10 @@ async function drawEdges(edges: CircuitAssembly['edges'], components: CircuitAss
 
 }
 
-async function drawRect(blocksRect: CircuitAssembly['blocks_rect'], offset: Offset = { x: 0, y: 0 }) {
+async function drawRect(blocksRect: CircuitAssembly['blocks_rect'], offset: Offset = { x: 0, y: 0 }, signal?: AbortSignal) {
 
     for (const block of blocksRect ?? []) {
+        signal?.throwIfAborted();
         try {
             if (block.name.includes('__v_root__')) continue;
             const padding = 5;
@@ -441,7 +453,7 @@ function getNetForUnusedPins(components: CircuitAssembly['components'], edges: C
     return netForUnusedPins;
 }
 
-async function assembleCircuitTask(circuit: CircuitAssembly) {
+async function assembleCircuitTask(circuit: CircuitAssembly, signal?: AbortSignal) {
     const startTimeTotal = Date.now();
     const logTiming = (label: string, startTime: number) => {
         const duration = Date.now() - startTime;
@@ -449,11 +461,13 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
         eda.sys_Log.add(`Time for ${label}: ${duration}ms (total: ${totalElapsed}ms)`, ESYS_LogType.INFO);
     };
     const runStep = async <T>(label: string, fn: () => Promise<T>) => {
+        signal?.throwIfAborted();
         const startedAt = Date.now();
         eda.sys_Log.add(`Assemble step start: ${label}`, ESYS_LogType.INFO);
 
         try {
             const result = await fn();
+            signal?.throwIfAborted();
             logTiming(label, startedAt);
             eda.sys_Log.add(`Assemble step done: ${label}`, ESYS_LogType.INFO);
             return result;
@@ -483,11 +497,9 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
     }
 
     await runStep('Checkpoint save', async () => {
-        if (eda.checkpointer) await eda.checkpointer.save(true);
-        else {
-            eda.sys_Log.add(`Checkpointer is null`);
-            eda.sys_Message.showToastMessage(`Checkpointer is null`, ESYS_ToastMessageType.INFO);
-        }
+        if (!eda.checkpointer) throw new Error('Checkpointer is unavailable');
+        const checkpointId = await eda.checkpointer.save(true);
+        if (!checkpointId) throw new Error('Failed to create schematic assembly checkpoint');
     });
 
     let { components, rm_components, edges, added_net } = circuit;
@@ -558,6 +570,7 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
     if (componentsAllowReplace.length) {
         await runStep('Execute component replacement', async () => {
             const tasks = componentsAllowReplace.map(async ({ component, replacer }) => {
+                signal?.throwIfAborted();
                 if (!component.part_uuid) return;
                 const primitive = replacer.getOldPrimitive();
                 if (!primitive) return;
@@ -565,6 +578,7 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
 
                 try {
                     await replacer.replace();
+                    signal?.throwIfAborted();
                     eda.sys_Log.add(`Replace ok: "${designator}"`);
 
                     components = components.filter(c => rmPartFromDesignator(c.designator) !== designator);
@@ -621,6 +635,7 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
         await runStep('Remove components', async () => {
             const addAddedNet = [];
             for (const designator of rm_components!) {
+                signal?.throwIfAborted();
                 const added = await removeComponent(designator, schematic).catch(e => {
                     const msg = `Error with rm component ${designator}: ${(e as Error).message}; ${(e as Error).stack}`;
                     eda.sys_Log.add(msg);
@@ -636,12 +651,12 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
         });
     }
 
-    const placedComp = await runStep('Place components', () => placeComponents(components, offset));
+    const placedComp = await runStep('Place components', () => placeComponents(components, offset, signal));
 
-    await runStep('Draw edges', () => drawEdges(edges, components, placedComp, offset));
+    await runStep('Draw edges', () => drawEdges(edges, components, placedComp, offset, signal));
 
     if (circuit.assembly_options?.draw_blocks) {
-        await runStep('Draw rectangles', () => drawRect(circuit.blocks_rect, offset));
+        await runStep('Draw rectangles', () => drawRect(circuit.blocks_rect, offset, signal));
     }
 
     const netForUnusedPins = await runStep('Get net for unused', async () => getNetForUnusedPins(components, edges, placedComp));
@@ -655,6 +670,7 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
 
     await runStep('Place nets', async () => {
         await placeNet(added_net ?? [], placedComp, true);
+        signal?.throwIfAborted();
         await placeNet(netForUnusedPins, placedComp, true);
     });
 
@@ -665,15 +681,17 @@ async function assembleCircuitTask(circuit: CircuitAssembly) {
     eda.sys_Log.add(`Assemble complete. Total time: ${totalDuration}ms`);
 }
 
-export function assembleCircuit(...args: Parameters<typeof assembleCircuitTask>) {
-    return assembleQueue.add(async () => {
+export function assembleCircuit(circuit: CircuitAssembly, parentSignal?: AbortSignal) {
+    return runAssemblyQueueTask(assembleQueue, 'schematic', parentSignal, async signal => {
+        signal.throwIfAborted();
         await sch_PrimitiveWireSnap.activate();
+        signal.throwIfAborted();
         try {
             if (VERSION_EDASYEDA[0] < 3) {
                 eda.sys_Log.add('[assemble] EasyEDA < 3 detected; using legacy assembler');
-                return await assembleCircuitTask(args[0]);
+                return await assembleCircuitTask(circuit, signal);
             }
-            return await assembleCircuitSourceTask(args[0], assembleCircuitTask, drawRect);
+            return await assembleCircuitSourceTask(circuit, assembleCircuitTask, drawRect, signal);
         } finally {
             sch_PrimitiveWireSnap.deactivate();
         }

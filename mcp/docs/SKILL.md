@@ -1,9 +1,13 @@
 ---
-name: easyeda-copilot-mcp
-description: Create, modify, place, route, or review EasyEDA schematics and PCBs with EasyEDA Copilot MCP tools. Execute JavaScript for focused API edits and operations not covered by the standard tools.
+name: easyeda-copilot
+description: Create, modify, place, route, or review EasyEDA schematics and PCBs with EasyEDA Copilot, using direct MCP tools when available or the generated standalone CLI skill.
 ---
 
-# EasyEDA Copilot MCP
+# EasyEDA Copilot
+
+Use the direct MCP tools when they are available. A generated standalone skill contains `build-info.json` and `scripts/easyeda-copilot-cli.js`; in that mode read [the CLI guide](cli.md), resolve the launcher's absolute path, and run it with Node.js >=20.19. Before first use, read `build-info.json`: an `npm` distribution requires `npm install --omit=dev` in `scripts/runtime/`, while a matching-platform `bundled` distribution does not. Stop if `installationBlockers` is nonempty.
+
+In CLI mode, run `node <absolute-launcher-path> start` once, retain the returned four-character daemon ID, and translate each tool invocation below to `<launcher> <id> call <tool>`. Omitted arguments are `{}`; use `<id> tools help <tool>` for the current JSON Schema rather than inferring arguments. Keep the same ID for a task and its long operations, then stop it when finished.
 
 Complete only the stage requested by the user. A schematic task does not authorize PCB work; placement does not authorize routing.
 
@@ -38,20 +42,22 @@ Keep a short working record: target instance/document UUID, requested stage, exa
 
 - New or substantially expanded schematics must use functional EasyEDA schematic pages.
 - Use explicit, resolved components with real part UUIDs.
+- Do not spend tool calls or visual-analysis tokens reviewing ordinary two-pin resistors, simple inductors/ferrite beads, fuses, or one-pin components. Skip symbol preview when all pin functions are already clear from their names, unless there is a concrete contradiction. Numeric/blank names or names identical to pin numbers do not establish function. For other components with any ambiguous pin (including capacitors, buttons, diodes, LEDs and unlabeled connectors), inspect only the selected candidate using its `preview_image_path` or `preview_component`; do not review every search result or repeat an already completed review of the same `part_uuid`. Capacitors are not exempt because polarity cannot be reliably inferred from search metadata. Images are local PNG files, not attached to tool responses. A symbol drawing is not proof of physical pin function or relay contact state; use the exact datasheet when uncertainty remains.
 - `beautify_schematic_on_current_page` rebuilds the entire current page. Every current-page component must appear in exactly one functional block.
-- `import_pcb_changes` confirms the exact visible `Apply Changes` action automatically. Continue on `applied` or `not_needed`; report `unavailable` rather than assuming completion.
+- After `import_pcb_changes`, stop and ask the user to confirm the EasyEDA import dialog. Do not continue until the user says it is complete.
 - Open the target PCB before `make_pcb_layout`; this supplies its outline and component positions to `preserve(...)`.
 - Treat placement and routing as one coupled physical problem: plan plausible signal, power, return, escape, and thermal paths before placement, then verify placement feasibility before routing. High density is valid when the intended layer and via strategy supports it.
 - Placement preview is not applied. Assemble only a reviewed, completed final `layoutId` within the user's authorization; follow the placement guide's approval rules.
 - Validate placement with [geometry and connectivity checks](pcb-layout/verification.md). Correct clear in-scope defects autonomously and continue [local refinement](pcb-layout/instructions.md#iterative-local-corrections) while it provides measurable improvement.
 - Plan critical circuits and their return paths together. Ground uses pours by default: route a specific critical return segment early only when required, and use ordinary GND tracks only for connections the verified fill cannot provide after appropriate pour/via corrections. For simple spacious boards, a complete single-call attempt is appropriate; otherwise use scoped passes. See the [routing strategy](pcb-routing/instructions.md#plan-globally-route-in-manageable-transactions) for sequencing, net scope and verification.
-- Long placement and routing calls returning `running` require `wait_operation` until terminal. Use [operations.md](operations.md) to interpret results and retry a saved application; restarting MCP loses in-memory operations.
+- Managed mutations, placement and routing calls returning `running` require `wait_operation` until terminal. Use [operations.md](operations.md) to interpret results and retry a saved application; restarting MCP loses in-memory operations.
 - Existing PCB copper and objects are preserved by placement assembly. Existing routing is preserved by the router unless `clearRouting(...)` explicitly selects copper to replace.
 - For stack-dependent routing intent, use verified physical data, declare and report a reasonable provisional stack, or ask for the missing data. Do not silently omit the semantic constraint.
 - After verification, decide whether to keep, repair, or restore the agent-applied result. Prefer a focused repair for a local error; restore a clearly invalid or broadly regressed result that cannot be repaired safely. Do not restore for a warning alone, and report the decision.
 - Before `execute_js`, read `execution/instructions.md`. Identify the exact document and affected objects, retain the checkpoint ID returned for the edit, then verify both the intended change and preservation of relevant surrounding objects. Read-only executions also create checkpoints: never assume the latest checkpoint is the baseline to restore.
 - A checkpoint covers the current document source, not the entire project or external state. A layout/refinement request does not authorize deleting projects, libraries or pages, clearing the whole design, or replacing unrelated content. Restore only a matching, explicit checkpoint after execution has finished and when doing so will not discard intervening user work; see [recovery](recovery.md).
-- `execute_js` waits up to 60 seconds and does not cancel JavaScript on timeout. Do not retry a mutation or restore while its execution outcome is unknown.
+- Managed MCP mutations return `operation_id` even when they finish within the initial 50-second wait. Use `list_operations` after losing an initial response, and `wait_operation` while running. Cancelling a wait does not cancel the operation; use `cancel_operation` explicitly. See [operation semantics](operations.md).
+- `execute_js` has a 60-second execution budget and may outlive cancellation or timeout. Do not retry a mutation or restore while its execution outcome is unknown.
 - `execute_js` returns small JSON inline; responses larger than 8 KiB, including execution errors, are saved to local artifacts. Binary results are always files. Read the relevant fields or file sections with local tools; do not dump the whole artifact back into context. See `execution/instructions.md` for formats and examples.
 
 ## Finish

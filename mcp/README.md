@@ -1,6 +1,12 @@
 English | [简体中文](README.zh-CN.md) | [Русский](README.ru.md)
 # easyeda-copilot-mcp
 
+## CLI and portable skill
+
+The existing MCP installation below is unchanged. You can also use `easyeda-copilot-cli`: run `start`, retain its four-character ID, then `<id> tools list`, `<id> tools help <tool>`, and `<id> call <tool> [--input file.json]`. Omitted input is `{}`. Use `<id> status` / `<id> stop` to manage your background runtime; no system service is installed.
+
+For lightweight and optional bundled local builds, see [install-guide.md](docs/install-guide.md). `npm run build:skill` derives the ignored root `skill/` from the current MCP runtime and `mcp/docs`; packaging code also lives under `mcp/`. See [CLI commands and build details](docs/cli.md).
+
 MCP server for EasyEDA Copilot.
 
 It connects MCP clients such as Codex or Claude Code to EasyEDA Desktop through the EasyEDA Copilot extension. It supports schematic work, component search, PCB placement, assembly, routing, inspection, and DRC.
@@ -99,3 +105,11 @@ Generic MCP config:
   }
 }
 ```
+
+### Cancellation
+
+MCP request cancellation is forwarded through the bridge to EasyEDA. Waiting commands are removed from the queue; active commands stop cooperatively. Already-started native actions or JavaScript may still finish, so cancellation does not authorize an automatic retry. Timeout watchdogs remain in place if cancellation cannot be delivered.
+
+Managed placement and routing operations have independent lifetimes. Cancelling their initial request or `wait_operation` stops only that wait. Use `cancel_operation` to stop the operation. Routing application has its own bridge timeout; it does not use the remaining time of a wait request.
+
+All tools expose explicit MCP effect annotations. Managed document mutations wait initially up to 50 seconds and return an operation ID; `list_operations` discovers retained work after a lost initial response. See [operation contracts](docs/operations.md) for exceptions and cancellation semantics.

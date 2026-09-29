@@ -2,11 +2,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp";
 import * as z from 'zod/v4';
 import { Bridge } from "../bridge";
 import { textResult } from "../utils/tool-result";
-import { componentSearch, searchReusedBlock } from "eda-copilot-backend/components";
+import { componentSearch, libraryList, searchReusedBlock } from "eda-copilot-backend/components";
+import type { Component } from "eda-copilot-backend/components";
 import { extractCircuit } from "eda-copilot-backend/schematic";
 import { SKILL_DOC_PATH } from "../utils/dirs";
 import { readFile } from "node:fs/promises";
 import { CircuitAssembly, CircuitMod, CircuitModStruct, ExplainCircuit } from "@copilot/shared/types/circuit";
+import { managedMutationHandler, toolHandler } from './handler';
+import { isMissingPartUuid, PartUuidStruct } from '@copilot/shared/types/lcsc';
+import { createComponentPreview, needsSymbolPreview } from '../utils/component-preview';
+import { readOtherPageSignals } from '../utils/other-page-signals';
 
 type SchematicBlocks = Record<string, string[]>;
 
@@ -52,6 +57,14 @@ function sheetSpaceNotice(response: unknown) {
         : undefined;
     const freePercent = sheetSpace?.freePercent;
     if (typeof freePercent !== 'number' || !Number.isFinite(freePercent)) return undefined;
+    if (sheetSpace?.fitsWithinPage === false) {
+        return {
+            freePercent,
+            fitsWithinPage: false,
+            level: 'warning',
+            message: 'The schematic overlaps the drawing frame or title block; increase the sheet size or adjust the layout.',
+        };
+    }
     const low = freePercent < 10;
     return {
         freePercent,
@@ -63,63 +76,76 @@ function sheetSpaceNotice(response: unknown) {
 }
 
 export function registerCircuitTools(server: McpServer, bridge: Bridge) {
-    const ComponentSearchKind = z.enum(['device', 'footprint', 'panel_library', 'all']);
-    const ComponentSearchLibrary = z.enum([
-        'system',
-        'recent',
-        'personal',
-        'project',
-        'public',
-        'std_edition_public',
-        'favorite',
-        'lcsc',
-        'all',
-    ]);
+    server.registerTool(
+        'library_list',
+        {
+            title: 'List EasyEDA Component Libraries',
+            description: 'List component libraries supported by the backend. Explicit public library UUIDs are also accepted by component_search.',
+            annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: z.object({}),
+        },
+        toolHandler(bridge, async () => textResult(libraryList())),
+    );
 
     server.registerTool(
         'component_search',
         {
             title: 'Search EasyEDA Component',
-            description: 'Search components. Exact part_uuid or MPN uses the LCSC catalog. Use query/kind/libraries for System, Recent, Personal, Project, Public, Std Edition Public, Favorite, and LCSC editor libraries. All sections are searched by default. Pass a device result uuid as part_uuid and its libraryUuid as library_uuid when adding it to the schematic.',
+            description: 'Search EasyEDA devices. library_uuid defaults to lcsc; use library_list to discover aliases. Search results include a ready-to-use part_uuid. Components with any ambiguous pin name may have preview_recommended and a local preview_image_path. Skip preview for one-pin parts, ordinary two-pin resistors, simple inductors and fuses, and parts with clear pin names. Capacitors are not exempt. Inspect only the selected uncertain candidate; do not review every result or repeat a completed review. Rendering failures leave the component in the result with preview_error.',
+            annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
             inputSchema: z.object({
-                part_uuid: z.string().nullable().optional(),
+                part_uuid: PartUuidStruct().nullable().optional(),
                 MPN: z.string().nullable().optional(),
-                query: z.string().nullable().optional()
-                    .describe('Keyword for searching the open EasyEDA editor libraries, such as "ESP32-S3" or "PCA9685".'),
-                kind: z.union([ComponentSearchKind, z.array(ComponentSearchKind)]).optional()
-                    .describe('EasyEDA library item type to search. Use all to search devices, footprints, and panel-library modules.'),
-                libraries: z.array(ComponentSearchLibrary).optional()
-                    .describe('Sections to search: System, Recent, Personal, Project, Public, Std Edition Public, Favorite, and LCSC. Defaults to all.'),
-                limit: z.number().int().min(1).max(50).default(10)
-                    .describe('Maximum results per searched section.'),
-                page: z.number().int().min(1).max(100).default(1)
-                    .describe('Search result page per section.'),
+                library_uuid: z.string().min(1).default('lcsc')
+                    .describe('Library alias or explicit public library UUID. Defaults to lcsc.'),
             }),
         },
-        async ({ part_uuid, MPN, query, kind, libraries, limit, page }) => {
-            const easyEdaQuery = query?.trim();
-            if (easyEdaQuery || kind || libraries?.length) {
-                if (!easyEdaQuery) {
-                    return textResult('Fill query when using kind or libraries.');
-                }
-
-                const result = await bridge.requestEasyEda('component-library-search', {
-                    query: easyEdaQuery,
-                    kind,
-                    libraries,
-                    limit,
-                    page,
-                }, 120_000);
-                return textResult(result);
-            }
-
+        toolHandler(bridge, async ({ part_uuid, MPN, library_uuid }) => {
             if (!part_uuid && !MPN) {
-                return textResult('Fill one: part_uuid, MPN, or query');
+                return textResult('Fill one: part_uuid or MPN');
             }
 
-            const result = await componentSearch({ part_uuid, MPN });
-            return textResult(result);
+            const result = await componentSearch({ part_uuid, MPN, library_uuid });
+            const annotate = async (component: Component) => {
+                const preview_recommended = needsSymbolPreview(component);
+                if (!preview_recommended) return component;
+                try {
+                    const preview = await createComponentPreview(component.part_uuid);
+                    return { ...component, preview_recommended, preview_image_path: preview.image_path };
+                } catch (error) {
+                    return {
+                        ...component,
+                        preview_recommended,
+                        preview_error: error instanceof Error ? error.message : String(error),
+                    };
+                }
+            };
+            const components = 'components' in result
+                ? await Promise.all((result.components as Component[]).map(annotate))
+                : undefined;
+            const bestComponent = result.bestComponent ? await annotate(result.bestComponent) : result.bestComponent;
+            return textResult({
+                ...result,
+                ...(components ? { components } : {}),
+                bestComponent,
+            });
+        }),
+    );
+
+    server.registerTool(
+        'preview_component',
+        {
+            title: 'Preview EasyEDA Component Symbol',
+            description: 'Render every section of an EasyEDA library schematic symbol with visible pin numbers. Returns only image_path for the generated PNG; no image is attached.',
+            annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+            inputSchema: z.object({
+                part_uuid: PartUuidStruct().describe('Ready-to-use part_uuid from component_search.'),
+            }),
         },
+        toolHandler(bridge, async ({ part_uuid }) => {
+            const preview = await createComponentPreview(part_uuid);
+            return textResult({ image_path: preview.image_path });
+        }),
     );
 
     // server.registerTool(
@@ -144,24 +170,27 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
         'extract_circuit_on_current_page',
         {
             title: 'Extract Circuit',
-            description: `Apply circuit changes to the current EasyEDA page. Every added component must include part_uuid. The result reports remaining current-sheet space and warns below 10%. For circuit modification docs, read: ${SKILL_DOC_PATH}`,
-            inputSchema: CircuitModStruct().partial().extend({
+            description: `Apply circuit changes to the current EasyEDA page. Every added component must include part_uuid. The result reports remaining current-sheet space and warns below 10%. Runs as a managed operation, waits up to 50 seconds, and always returns operation_id. For circuit modification docs, read: ${SKILL_DOC_PATH}`,
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+            inputSchema: CircuitModStruct().extend({
                 file_path: z.string().min(1).optional()
                     .describe('Path to a UTF-8 JSON file containing CircuitMod. Provide either file_path or inline circuit fields.'),
             }),
         },
-        async ({ file_path, ...inlineCircuit }) => {
-            if (file_path !== undefined && Object.values(inlineCircuit).some(value => value !== undefined)) {
+        managedMutationHandler(bridge, 'extract_circuit_on_current_page', async ({ file_path, ...inlineCircuit }) => {
+            const hasInlineChanges = inlineCircuit.add_components.length > 0
+                || inlineCircuit.add_reused_blocks.length > 0
+                || inlineCircuit.rm_components !== null
+                || inlineCircuit.external_rm_connect !== null
+                || inlineCircuit.external_connect !== null;
+            if (file_path !== undefined && hasInlineChanges) {
                 throw new Error('Provide either file_path or inline circuit fields, not both.');
             }
             const circuit = CircuitModStruct().parse(file_path !== undefined
                 ? JSON.parse(await readFile(file_path, 'utf8'))
                 : inlineCircuit);
-            if (circuit.add_components.some(c => c.library_uuid || !/^[0-9a-f]{32}$/.test(c.part_uuid))) {
-                return textResult(await bridge.requestEasyEda('apply-library-circuit', circuit as unknown as Record<string, unknown>, 300000));
-            }
             const missingPartUuid = circuit.add_components
-                .filter(component => !component.part_uuid || /^0+$/.test(component.part_uuid))
+                .filter(component => isMissingPartUuid(component.part_uuid))
                 .map(component => component.designator);
 
             if (missingPartUuid.length) {
@@ -172,24 +201,25 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             }
 
             const resolvedInputCircuit = await bridge.requestEasyEda('get-schematic') as ExplainCircuit;
-            if (resolvedInputCircuit.components.some(c => c.library_uuid || (c.part_uuid && !/^[0-9a-f]{32}$/.test(c.part_uuid)))) {
-                return textResult(await bridge.requestEasyEda('apply-library-circuit', circuit as unknown as Record<string, unknown>, 300000));
-            }
-            const result = await extractCircuit({ circuit, inputCircuit: resolvedInputCircuit });
-            const assembled = await bridge.requestEasyEda('assemble-circuit', result as Record<string, unknown>, 300000);
+            const otherPageSignals = await readOtherPageSignals(() => bridge.requestEasyEda('get-other-page-signals'));
+            const result = await extractCircuit({ circuit, inputCircuit: resolvedInputCircuit,
+                assemblyOptions: { otherPageSignals } });
+            const assembled = await bridge.requestEasyEda('assemble-circuit', result as Record<string, unknown>);
             const sheetSpace = sheetSpaceNotice(assembled);
             return textResult({
                 message: 'Circuit sent to EasyEDA for assembly.',
+                checkpointId: (assembled as { checkpointId?: string }).checkpointId,
                 ...(sheetSpace ? { sheetSpace } : {}),
             });
-        },
+        }),
     );
 
     server.registerTool(
         'beautify_schematic_on_current_page',
         {
             title: 'Beautify EasyEDA Schematic',
-            description: `Reassemble every component on the current EasyEDA schematic page into named functional blocks. The blocks must cover the whole page. A checkpoint is saved before replacement, and failures restore it automatically. For circuit workflow docs, read: ${SKILL_DOC_PATH}`,
+            description: `Reassemble every component on the current EasyEDA schematic page into named functional blocks. The blocks must cover the whole page. A checkpoint is saved before replacement, and failures restore it automatically. Runs as a managed operation, waits up to 50 seconds, and always returns operation_id. For circuit workflow docs, read: ${SKILL_DOC_PATH}`,
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
             inputSchema: z.object({
                 blocks: z.record(
                     z.string().min(1).describe('Block name.'),
@@ -197,10 +227,13 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
                 ).describe('All current-page components grouped by block name.'),
                 draw_block_box: z.boolean().default(false)
                     .describe('Draw Copilot-managed boxes and labels around functional blocks.'),
+                auto_resize_page: z.boolean().default(true)
+                    .describe('Shrink or grow the schematic drawing sheet to the smallest standard format that fits the layout inside its frame and title block.'),
             }),
         },
-        async ({ blocks, draw_block_box }) => {
-            const inputCircuit = await bridge.requestEasyEda('get-schematic') as ExplainCircuit;
+        managedMutationHandler(bridge, 'beautify_schematic_on_current_page', async ({ blocks, draw_block_box, auto_resize_page }) => {
+            const inputCircuit = await bridge.requestEasyEda('get-schematic', { includePortStyles: true }) as ExplainCircuit;
+            const otherPageSignals = await readOtherPageSignals(() => bridge.requestEasyEda('get-other-page-signals'));
             if (!inputCircuit.components.length) throw new Error('The current schematic page has no components.');
 
             const requested = selectedBlocks(blocks);
@@ -215,7 +248,7 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             if (missing.length) throw new Error(`Blocks do not cover the whole current page. Missing: ${missing.join(', ')}`);
 
             const missingPartUuid = [...components]
-                .filter(([, component]) => !component.part_uuid || /^0+$/.test(component.part_uuid))
+                .filter(([, component]) => isMissingPartUuid(component.part_uuid))
                 .map(([designator]) => designator);
             if (missingPartUuid.length) {
                 throw new Error(`Components have no part_uuid: ${missingPartUuid.join(', ')}`);
@@ -248,6 +281,7 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             const response = await extractCircuit({
                 circuit,
                 inputCircuit: { components: [] },
+                assemblyOptions: { otherPageSignals },
             });
             const assembly = serverAssembly(response);
             if (!assembly || !Array.isArray(assembly.components)) {
@@ -266,19 +300,22 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
             assembly.assembly_options = {
                 ...assembly.assembly_options,
                 draw_blocks: draw_block_box,
+                auto_resize_page,
             };
 
-            await bridge.requestEasyEda('beautify-current-page', {
+            const assembled = await bridge.requestEasyEda('beautify-current-page', {
                 circuit: assembly,
                 checkpointId,
                 expectedDesignators: [...components.keys()],
-            }, 300000);
+            });
+            const sheetSpace = sheetSpaceNotice(assembled);
 
             return textResult({
                 message: 'Current EasyEDA schematic page beautified.',
                 checkpointId,
+                ...(sheetSpace ? { sheetSpace } : {}),
             });
-        },
+        }),
     );
 
     server.registerTool(
@@ -286,17 +323,18 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
         {
             title: 'Get Schematic',
             description: 'Get the current EasyEDA schematic page, or all pages with get_full_schematic. Responses over 8 KiB are saved to a file.',
+            annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
             inputSchema: z.object({
                 get_full_schematic: z.boolean().default(false)
                     .describe('Get Full Schematic: retrieve the schematic from all pages.'),
             }),
         },
-        async ({ get_full_schematic }) => {
+        toolHandler(bridge, async ({ get_full_schematic }) => {
             const result = await bridge.requestEasyEda(get_full_schematic
                 ? 'get-multi-page-schematic' : 'get-schematic') as ExplainCircuit;
             const schematic = { ...result, components: result.components.map(c => ({ ...c, pos: undefined, })) };
 
             return textResult(schematic);
-        },
+        }),
     );
 }

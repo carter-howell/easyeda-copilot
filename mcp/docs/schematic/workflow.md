@@ -2,13 +2,13 @@
 
 Use this workflow without continuing to PCB work unless the user explicitly asks for it.
 
-For local context missing from the netlist, use [schematic groups](groups.md): `get_current_page_schematic_groups` returns likely blocks and direct non-ground wire islands for the current page, or concatenated page-local results for the full schematic.
+For local context missing from the netlist, use [schematic groups](groups.md): `get_schematic_groups` returns likely blocks and direct non-ground wire islands for the current page, or concatenated page-local results for the full schematic.
 
 ## Create or modify
 
 1. Resolve the target schematic and functional page.
 2. Open that page and read it with `get_schematic`. Set `get_full_schematic: true` to read all schematic pages instead.
-3. Search only unknown parts with `component_search` and use explicit, resolved components.
+3. Search only unknown parts with `component_search` and use explicit, resolved components. It searches the `lcsc` library by default. Call `library_list` when a public-library component is needed, then pass its alias or explicit public library UUID as `library_uuid`. Results with ambiguous pin names may have `preview_recommended: true` and a local PNG `preview_image_path`. Skip preview for one-pin components, ordinary two-pin resistors, simple inductors/ferrite beads and fuses, or components whose pin functions are already clear from their names. Do not spend tool calls or visual-analysis tokens on these checks without a concrete contradiction. Capacitors are not exempt: polarity cannot be reliably inferred from search metadata. For other parts with any blank, numeric or number-identical pin name (including mixed named/unnamed pins), inspect only the selected candidate, using its PNG or `preview_component({ part_uuid })`. Do not inspect every search result or repeat a completed review of the same `part_uuid`. Verify unresolved pin functions against the exact part datasheet before connecting them.
 4. Apply related changes with `extract_circuit_on_current_page`. Prefer one coherent call per page; multiple calls are allowed when staged checking is safer.
    - Inspect the returned `sheetSpace`.
    - If less than `10%` remains, finish the current function and continue substantial independent work on another functional page.
@@ -17,6 +17,7 @@ For local context missing from the netlist, use [schematic groups](groups.md): `
    - recommended after completing a new AI-generated page;
    - requires every component on the current page, grouped exactly once.
    - Keep `draw_block_box: false` unless the user wants Copilot-managed functional boxes and labels.
+   - `auto_resize_page` defaults to `true`: shrink or grow a standard drawing sheet to the smallest fitting format (A4–A0), leaving room for its border and title block. Custom or inconsistent drawing sheets retain their size. Set it to `false` to keep the current sheet size.
 6. Follow [schematic verification](verification.md); reread the page when exact connectivity readback is needed.
 7. Report the affected page and stop at the schematic boundary.
 

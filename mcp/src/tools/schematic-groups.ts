@@ -3,10 +3,11 @@ import * as z from 'zod/v4';
 import type { Bridge } from '../bridge';
 import type { SchematicGroups } from '@copilot/shared/types/schematic-groups';
 import { textResult } from '../utils/tool-result';
+import { toolHandler } from './handler';
 
 export function registerSchematicGroupTools(server: McpServer, bridge: Bridge) {
     server.registerTool(
-        'get_current_page_schematic_groups',
+        'get_schematic_groups',
         {
             title: 'Get EasyEDA Schematic Groups',
             description: 'Read the current schematic page and return heuristic component groups plus direct non-ground wire islands. '
@@ -19,9 +20,9 @@ export function registerSchematicGroupTools(server: McpServer, bridge: Bridge) {
             }),
             annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         },
-        async ({ get_full_schematic_groups }) => {
-            const result = await bridge.requestEasyEda('get-schematic-groups', { get_full_schematic_groups }, 120_000) as SchematicGroups;
+        toolHandler(bridge, async ({ get_full_schematic_groups }) => {
+            const result = await bridge.requestEasyEda('get-schematic-groups', { get_full_schematic_groups }) as SchematicGroups;
             return textResult(result);
-        },
+        }),
     );
 }
