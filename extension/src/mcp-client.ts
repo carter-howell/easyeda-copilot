@@ -21,6 +21,7 @@ import {
 } from './eda/pcb';
 import { getOtherPageSignals, getSchematic } from './eda/schematic';
 import { getSchematicGroups, mergeSchematicGroups } from './eda/schematic-groups';
+import { searchComponentLibraries } from '../../additions/extension/library-search';
 import { assertMcpDocumentContext } from './eda/mcp-document-context';
 import { serializeProjectInfo } from './eda/project-info';
 import { estimateSchematicSheetSpace } from './eda/sheet-space';
@@ -1695,6 +1696,11 @@ async function handleMessage(message: McpMessage, connectionEpoch: number, signa
             const pcb = await getPcb();
             const result = await inspectComponent(pcb, designator, radius);
             reply(true, result);
+            return;
+        }
+
+        if (message.event === 'component-library-search') {
+            reply(true, await searchComponentLibraries(body));
             return;
         }
 

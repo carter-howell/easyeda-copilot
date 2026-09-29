@@ -76,6 +76,11 @@ function sheetSpaceNotice(response: unknown) {
 }
 
 export function registerCircuitTools(server: McpServer, bridge: Bridge) {
+    const ComponentSearchKind = z.enum(['device', 'footprint', 'panel_library', 'all']);
+    const ComponentSearchLibrary = z.enum([
+        'system', 'recent', 'personal', 'project', 'public', 'std_edition_public', 'favorite', 'lcsc', 'all',
+    ]);
+
     server.registerTool(
         'library_list',
         {
@@ -91,18 +96,40 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
         'component_search',
         {
             title: 'Search EasyEDA Component',
-            description: 'Search EasyEDA devices. library_uuid defaults to lcsc; use library_list to discover aliases. Search results include a ready-to-use part_uuid. Components with any ambiguous pin name may have preview_recommended and a local preview_image_path. Skip preview for one-pin parts, ordinary two-pin resistors, simple inductors and fuses, and parts with clear pin names. Capacitors are not exempt. Inspect only the selected uncertain candidate; do not review every result or repeat a completed review. Rendering failures leave the component in the result with preview_error.',
+            description: 'Search EasyEDA devices. Use part_uuid or MPN for the backend LCSC/public catalog. Use query to search all live EasyEDA editor sections, including System, Recent, Personal, Project, Public, Standard Edition Public, Favorite and LCSC.',
             annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
             inputSchema: z.object({
                 part_uuid: PartUuidStruct().nullable().optional(),
                 MPN: z.string().nullable().optional(),
                 library_uuid: z.string().min(1).default('lcsc')
                     .describe('Library alias or explicit public library UUID. Defaults to lcsc.'),
+                query: z.string().nullable().optional()
+                    .describe('Keyword search across live EasyEDA editor libraries.'),
+                kind: z.union([ComponentSearchKind, z.array(ComponentSearchKind)]).optional()
+                    .describe('Editor-library object type. Defaults to device.'),
+                libraries: z.array(ComponentSearchLibrary).optional()
+                    .describe('Editor sections to search. Defaults to every section.'),
+                limit: z.number().int().min(1).max(50).default(10)
+                    .describe('Maximum results per editor section.'),
+                page: z.number().int().min(1).max(100).default(1)
+                    .describe('Editor-library result page.'),
             }),
         },
-        toolHandler(bridge, async ({ part_uuid, MPN, library_uuid }) => {
+        toolHandler(bridge, async ({ part_uuid, MPN, library_uuid, query, kind, libraries, limit, page }) => {
+            const editorQuery = query?.trim();
+            if (editorQuery || kind || libraries?.length) {
+                if (!editorQuery) return textResult('Fill query when using kind or libraries.');
+                const result = await bridge.requestEasyEda('component-library-search', {
+                    query: editorQuery,
+                    kind,
+                    libraries,
+                    limit,
+                    page,
+                }, 120_000);
+                return textResult(result);
+            }
             if (!part_uuid && !MPN) {
-                return textResult('Fill one: part_uuid or MPN');
+                return textResult('Fill one: part_uuid, MPN, or query');
             }
 
             const result = await componentSearch({ part_uuid, MPN, library_uuid });
