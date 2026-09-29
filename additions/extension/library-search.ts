@@ -3,9 +3,33 @@ type Scope = typeof libraryScopes[number];
 type Kind = 'device' | 'footprint' | 'panel_library';
 const labels: Record<Scope, string> = { system: 'System', recent: 'Recent', personal: 'Personal', project: 'Project', public: 'Public', std_edition_public: 'Std Edition Public', favorite: 'Favorite', lcsc: 'LCSC' };
 
-// Verified against the running EasyEDA Pro 3.2.149 library manager and search RPCs.
 const aliases: Partial<Record<Scope, string>> = { recent: 'recent', public: 'user', std_edition_public: 'stdPublic', lcsc: 'lcsc' };
+
+function errorMessage(error: unknown) {
+    if (error instanceof Error) return `${error.name}: ${error.message}`;
+    if (typeof error === 'string') return error;
+    try { return JSON.stringify(error); } catch { return String(error); }
+}
+
+async function extendedLibraryUuid(scope: 'public' | 'std_edition_public' | 'lcsc') {
+    const libraries = await eda.lib_LibrariesList.getAllLibrariesList();
+    const normalized = libraries.map(library => ({
+        library,
+        name: String(library.name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(),
+    }));
+    const match = scope === 'std_edition_public'
+        ? normalized.find(({ name }) => (name.includes('standard') || name.includes('std')) && name.includes('public'))
+        : scope === 'lcsc'
+            ? normalized.find(({ name }) => name.includes('lcsc') || name.includes('scsc'))
+            : normalized.find(({ name }) => name === 'public' || (name.includes('public') && !name.includes('standard')));
+    return match?.library.uuid;
+}
+
 export async function resolveLibrary(scope: Scope): Promise<string> {
+    if (scope === 'public' || scope === 'std_edition_public' || scope === 'lcsc') {
+        const uuid = await extendedLibraryUuid(scope).catch(() => undefined);
+        if (uuid) return uuid;
+    }
     if (aliases[scope]) return aliases[scope]!;
     const getters = {
         system: () => eda.lib_LibrariesList.getSystemLibraryUuid(),
@@ -42,7 +66,7 @@ export async function searchComponentLibraries(body: Record<string, unknown>) {
         let libraryUuid: string;
         try { libraryUuid = await resolveLibrary(scope); }
         catch (error) {
-            for (const kind of kinds) sections.push({ scope, section: labels[scope], kind, count: 0, results: [], error: String(error) });
+            for (const kind of kinds) sections.push({ scope, section: labels[scope], kind, count: 0, results: [], error: errorMessage(error) });
             continue;
         }
         for (const kind of kinds) {
@@ -55,7 +79,7 @@ export async function searchComponentLibraries(body: Record<string, unknown>) {
                 const results = raw.map(item => ({ ...item, libraryUuid: item.libraryUuid || libraryUuid }));
                 sections.push({ scope, section: labels[scope], kind, libraryUuid, count: results.length, results });
             } catch (error) {
-                sections.push({ scope, section: labels[scope], kind, libraryUuid, count: 0, results: [], error: String(error) });
+                sections.push({ scope, section: labels[scope], kind, libraryUuid, count: 0, results: [], error: errorMessage(error) });
             }
         }
     }

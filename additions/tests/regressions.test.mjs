@@ -117,13 +117,20 @@ test('every library scope has its own verified lookup; results are not duplicate
   const calls = [];
   const search = async (q, lib) => { calls.push(lib); return [{ uuid: 'device', libraryUuid: lib }]; };
   const eda = {
-    lib_LibrariesList: Object.fromEntries(['System', 'Personal', 'Project', 'Favorite'].map(name => ['get' + name + 'LibraryUuid', async () => name])),
+    lib_LibrariesList: {
+      ...Object.fromEntries(['System', 'Personal', 'Project', 'Favorite'].map(name => ['get' + name + 'LibraryUuid', async () => name])),
+      getAllLibrariesList: async () => [
+        { name: 'Public', uuid: 'PublicUuid' },
+        { name: 'Std Edition Public', uuid: 'StdPublicUuid' },
+        { name: 'LCSC Electronics Parts', uuid: 'LcscUuid' },
+      ],
+    },
     lib_Device: { search }, lib_Footprint: { search }, lib_PanelLibrary: { search },
   };
   const { searchComponentLibraries } = await moduleFrom('../extension/library-search.ts', { eda });
   const result = await searchComponentLibraries({ query: 'PCA9685', libraries: ['all'], kind: 'all' });
   assert.equal(result.sections.length, 24);
-  assert.deepEqual([...new Set(calls)], ['System', 'recent', 'Personal', 'Project', 'user', 'stdPublic', 'Favorite', 'lcsc']);
+  assert.deepEqual([...new Set(calls)], ['System', 'recent', 'Personal', 'Project', 'PublicUuid', 'StdPublicUuid', 'Favorite', 'LcscUuid']);
   assert.equal(result.flatResults, undefined);
   assert.equal(result.sections.every(s => s.count === 1 && !s.error), true);
   eda.lib_LibrariesList.getPersonalLibraryUuid = async () => { throw Error('offline'); };
