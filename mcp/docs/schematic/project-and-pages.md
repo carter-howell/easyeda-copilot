@@ -51,3 +51,26 @@ New or substantially expanded schematics must be divided into functional pages s
 5. Call `open_document` with the target page UUID before reading or modifying it.
 
 `delete_doc` is destructive. Use it only when deletion is explicitly requested and the exact target was verified.
+
+Deleting a board by name preserves its linked schematic and PCB documents by default and removes only the board container/association:
+
+```json
+{
+  "doc": {
+    "board_name": "TemporaryBoard"
+  }
+}
+```
+
+To permanently delete the board container and both linked documents, the caller must explicitly opt in:
+
+```json
+{
+  "doc": {
+    "board_name": "TemporaryBoard",
+    "delete_linked_documents": true
+  }
+}
+```
+
+The cascading form deletes the linked schematic and PCB first, verifies that each is absent from the EasyEDA inventory, and deletes the board container only after both child deletions succeed. EasyEDA may automatically remove the empty board after its final linked document is deleted. A partial failure leaves the board container in place so cleanup can be inspected and retried.

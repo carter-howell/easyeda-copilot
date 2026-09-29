@@ -43,6 +43,19 @@ export const CreateDocInputSchema = z.object({
     ]),
 });
 
+export const DeleteDocInputSchema = z.object({
+    doc: z.union([
+        z.object({
+            uuid: z.string().min(1).describe('Schematic, schematic page, or PCB UUID.'),
+        }).strict(),
+        z.object({
+            board_name: z.string().min(1).describe('Board container name.'),
+            delete_linked_documents: z.boolean().optional().default(false)
+                .describe('When true, also permanently delete the linked schematic and PCB. Defaults to false, which deletes only the board container/association.'),
+        }).strict(),
+    ]),
+});
+
 export async function openDocument(bridge: Bridge, input: z.infer<typeof OpenDocumentInputSchema>) {
     return input.project_uuid
         ? bridge.requestEasyEda('open-project', { projectUuid: input.project_uuid })
@@ -157,11 +170,9 @@ export function registerDocsTools(server: McpServer, bridge: Bridge) {
         'delete_doc',
         {
             title: 'Delete EasyEDA Doc',
-            description: 'Delete a doc from the current EasyEDA project. This is destructive!',
+            description: 'Delete a schematic, schematic page, PCB, or board container from the current EasyEDA project. Board deletion preserves its linked schematic and PCB by default. Set doc.delete_linked_documents to true only to permanently delete the board container and both linked documents.',
             annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
-            inputSchema: z.object({
-                doc: DOC_QUERY,
-            }),
+            inputSchema: DeleteDocInputSchema,
         },
         toolHandler(bridge, async ({ doc }) => {
             const result = await bridge.requestEasyEda('delete-doc', { ...doc });
